@@ -1,0 +1,11 @@
+../Drivers/Project_drv/analog.c:59:14:ANALOG_CalcVddaFromVrefint	32	static
+../Drivers/Project_drv/analog.c:74:6:ANALOG_Init	16	static
+../Drivers/Project_drv/analog.c:85:13:ANALOG_ConfigChannel	40	static
+../Drivers/Project_drv/analog.c:108:13:ANALOG_StartStep	16	static
+../Drivers/Project_drv/analog.c:159:6:ANALOG_RequestUpdate	8	static
+../Drivers/Project_drv/analog.c:164:9:ANALOG_IsBusy	8	static
+../Drivers/Project_drv/analog.c:169:6:ANALOG_Task	56	static
+../Drivers/Project_drv/analog.c:285:10:ANALOG_GetUpdateId	8	static
+../Drivers/Project_drv/analog.c:290:7:ANALOG_GetLight	8	static
+../Drivers/Project_drv/analog.c:295:7:ANALOG_GetBat	8	static
+../Drivers/Project_drv/analog.c:300:7:ANALOG_GetVcc	8	static

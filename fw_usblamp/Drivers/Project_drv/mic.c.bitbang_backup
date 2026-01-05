@@ -1,0 +1,280 @@
+/*
+ * mic.c — PDM MIC test using SPI1 RX-only DMA
+ *
+ * Uses:
+ *  - PA5 as SCK output (bit-banged ~200kHz)
+ *  - PA6 as DATA input (sampled)
+ *
+ * Function kept for compatibility:
+ *   float MIC_ReadDbFS_Debug(void);
+ *
+ * Return:
+ *  - 0.0   => DATA constant (mic not sending / wrong wiring / stuck)
+ *  - >0.0  => DATA active (returns activity %)
+ *  - -1.0  => internal timer init fail (rare)
+ *
+ * Prints:
+ *  - unique signature line so you know this code is running
+ */
+
+#include "main.h"
+#include "stm32u0xx_hal.h"
+#include <stdint.h>
+#include <stdio.h>
+
+/* --- Pins --- */
+#define MIC_SCK_PORT GPIOA
+#define MIC_SCK_PIN  GPIO_PIN_5   // PA5
+
+#define MIC_DAT_PORT GPIOA
+#define MIC_DAT_PIN  GPIO_PIN_6   // PA6
+
+/* --- Test parameters --- */
+#define MIC_BB_FREQ_HZ     200000u   // 200 kHz bit-bang clock
+#define MIC_BB_DURATION_MS 100u      // generate clock for 100ms (~20k cycles)
+
+/* Small compensation for software overhead (tunes freq a bit closer) */
+#define MIC_HALF_TICKS_COMP 8u
+
+/* ---- Helpers: save/restore GPIO config per pin (only that pin’s bits) ---- */
+typedef struct {
+    uint32_t moder_bits;
+    uint32_t pupdr_bits;
+    uint32_t ospeed_bits;
+    uint32_t otype_bit;
+    uint32_t afr_bits;
+} gpio_pin_cfg_t;
+
+static void gpio_save_pin(GPIO_TypeDef *port, uint8_t pin_num, gpio_pin_cfg_t *cfg)
+{
+    uint32_t pos2  = (uint32_t)pin_num * 2u;
+    uint32_t pos4  = (uint32_t)pin_num * 4u;
+    uint32_t afr_i = (pin_num < 8u) ? 0u : 1u;
+    uint32_t afr_s = (pin_num < 8u) ? pos4 : ((uint32_t)(pin_num - 8u) * 4u);
+
+    cfg->moder_bits  = (port->MODER   >> pos2) & 0x3u;
+    cfg->pupdr_bits  = (port->PUPDR   >> pos2) & 0x3u;
+    cfg->ospeed_bits = (port->OSPEEDR >> pos2) & 0x3u;
+    cfg->otype_bit   = (port->OTYPER  >> pin_num) & 0x1u;
+    cfg->afr_bits    = (port->AFR[afr_i] >> afr_s) & 0xFu;
+}
+
+static void gpio_restore_pin(GPIO_TypeDef *port, uint8_t pin_num, const gpio_pin_cfg_t *cfg)
+{
+    uint32_t pos2  = (uint32_t)pin_num * 2u;
+    uint32_t pos4  = (uint32_t)pin_num * 4u;
+    uint32_t afr_i = (pin_num < 8u) ? 0u : 1u;
+    uint32_t afr_s = (pin_num < 8u) ? pos4 : ((uint32_t)(pin_num - 8u) * 4u);
+
+    port->MODER   = (port->MODER   & ~(0x3u << pos2)) | (cfg->moder_bits  << pos2);
+    port->PUPDR   = (port->PUPDR   & ~(0x3u << pos2)) | (cfg->pupdr_bits  << pos2);
+    port->OSPEEDR = (port->OSPEEDR & ~(0x3u << pos2)) | (cfg->ospeed_bits << pos2);
+
+    if (cfg->otype_bit) port->OTYPER |=  (1u << pin_num);
+    else                port->OTYPER &= ~(1u << pin_num);
+
+    port->AFR[afr_i] = (port->AFR[afr_i] & ~(0xFu << afr_s)) | (cfg->afr_bits << afr_s);
+}
+
+/* ---- Simple tick timer using TIM16 (APB2). We use it only for micro-delays. ---- */
+static uint8_t tim16_start_free_run_48m(void)
+{
+#if defined(TIM16)
+    __HAL_RCC_TIM16_CLK_ENABLE();
+
+    TIM16->CR1 = 0;
+    TIM16->PSC = 0;          // tick = timer clock
+    TIM16->ARR = 0xFFFF;
+    TIM16->CNT = 0;
+    TIM16->CR1 |= TIM_CR1_CEN;
+    return 1u;
+#else
+    return 0u;
+#endif
+}
+
+static inline void tim16_stop(void)
+{
+#if defined(TIM16)
+    TIM16->CR1 &= ~TIM_CR1_CEN;
+#endif
+}
+
+static inline uint16_t tim16_now(void)
+{
+#if defined(TIM16)
+    return (uint16_t)TIM16->CNT;
+#else
+    return 0;
+#endif
+}
+
+/* wait for (ticks) TIM16 counts (16-bit safe wrap) */
+static inline void tim16_wait_ticks(uint16_t ticks)
+{
+#if defined(TIM16)
+    uint16_t t0 = tim16_now();
+    while ((uint16_t)(tim16_now() - t0) < ticks) { __NOP(); }
+#else
+    (void)ticks;
+#endif
+}
+
+/* ---- Optional: disable EXTI group to avoid storms while toggling/sampling ---- */
+static inline void exti_disable_group(void)
+{
+#if defined(EXTI4_15_IRQn)
+    HAL_NVIC_DisableIRQ(EXTI4_15_IRQn);
+#elif defined(EXTI9_5_IRQn)
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+#endif
+}
+
+static inline void exti_enable_group(void)
+{
+#if defined(EXTI4_15_IRQn)
+    HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+#elif defined(EXTI9_5_IRQn)
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+#endif
+}
+
+/* ---- Configure pins for bitbang test ---- */
+static void mic_bb_gpio_setup(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /* PA5 output push-pull, high speed, no pull */
+    // MODER(5)=01
+    MIC_SCK_PORT->MODER   = (MIC_SCK_PORT->MODER & ~(0x3u << (5u*2u))) | (0x1u << (5u*2u));
+    // OTYPER(5)=0
+    MIC_SCK_PORT->OTYPER &= ~(1u << 5u);
+    // OSPEEDR(5)=11 (high)
+    MIC_SCK_PORT->OSPEEDR = (MIC_SCK_PORT->OSPEEDR & ~(0x3u << (5u*2u))) | (0x3u << (5u*2u));
+    // PUPDR(5)=00
+    MIC_SCK_PORT->PUPDR  &= ~(0x3u << (5u*2u));
+
+    /* PA6 input, no pull */
+    // MODER(6)=00
+    MIC_DAT_PORT->MODER  &= ~(0x3u << (6u*2u));
+    // PUPDR(6)=00
+    MIC_DAT_PORT->PUPDR  &= ~(0x3u << (6u*2u));
+}
+
+/* ---- Main API: keep name ---- */
+float MIC_ReadDbFS_Debug(void)
+{
+    /* Signature so you know THIS code is running */
+    printf("### MICDBG_BITBANG_200K_V1 ###\r\n");
+
+    exti_disable_group();
+
+    /* Save GPIO config for PA5/PA6 and restore after */
+    gpio_pin_cfg_t pa5_cfg, pa6_cfg;
+    gpio_save_pin(GPIOA, 5, &pa5_cfg);
+    gpio_save_pin(GPIOA, 6, &pa6_cfg);
+
+    /* Setup pins for bitbang */
+    mic_bb_gpio_setup();
+
+    /* Start TIM16 as micro-delay base */
+    if (!tim16_start_free_run_48m()) {
+        printf("[AUD] FAIL: TIM16 not available\r\n");
+        gpio_restore_pin(GPIOA, 5, &pa5_cfg);
+        gpio_restore_pin(GPIOA, 6, &pa6_cfg);
+        exti_enable_group();
+        return -1.0f;
+    }
+
+    /* Compute delay ticks for half-period */
+    uint32_t tim_clk = HAL_RCC_GetPCLK2Freq(); // TIM16 on APB2
+    if (tim_clk == 0u) tim_clk = 48000000u;
+
+    uint32_t half_ticks_u32 = tim_clk / (2u * MIC_BB_FREQ_HZ);
+    if (half_ticks_u32 < 4u) half_ticks_u32 = 4u;
+
+    /* compensate software overhead a bit */
+    if (half_ticks_u32 > MIC_HALF_TICKS_COMP + 2u) {
+        half_ticks_u32 -= MIC_HALF_TICKS_COMP;
+    }
+
+    uint16_t half_ticks = (uint16_t)half_ticks_u32;
+    uint16_t mid_ticks  = (uint16_t)(half_ticks / 2u);
+    uint16_t tail_ticks = (uint16_t)(half_ticks - mid_ticks);
+
+    /* How many full clock cycles to generate */
+    uint32_t tx_cycles = (MIC_BB_FREQ_HZ * MIC_BB_DURATION_MS) / 1000u;
+    if (tx_cycles == 0u) tx_cycles = 1000u;
+
+    /* Sampling statistics */
+    uint32_t rx_samples = 0;
+    uint32_t rx_ones    = 0;
+    uint32_t rx_trans   = 0;
+
+    uint32_t prev = (MIC_DAT_PORT->IDR & MIC_DAT_PIN) ? 1u : 0u;
+
+    /* Generate clock + sample DATA in the middle of HIGH and LOW */
+    for (uint32_t i = 0; i < tx_cycles; i++)
+    {
+        /* SCK HIGH */
+        MIC_SCK_PORT->BSRR = (uint32_t)MIC_SCK_PIN;
+
+        tim16_wait_ticks(mid_ticks);
+        uint32_t v1 = (MIC_DAT_PORT->IDR & MIC_DAT_PIN) ? 1u : 0u;
+        rx_samples++;
+        rx_ones += v1;
+        if (v1 != prev) { rx_trans++; prev = v1; }
+        tim16_wait_ticks(tail_ticks);
+
+        /* SCK LOW */
+        MIC_SCK_PORT->BSRR = ((uint32_t)MIC_SCK_PIN << 16);
+
+        tim16_wait_ticks(mid_ticks);
+        uint32_t v2 = (MIC_DAT_PORT->IDR & MIC_DAT_PIN) ? 1u : 0u;
+        rx_samples++;
+        rx_ones += v2;
+        if (v2 != prev) { rx_trans++; prev = v2; }
+        tim16_wait_ticks(tail_ticks);
+    }
+
+    tim16_stop();
+
+    /* Restore GPIO configs */
+    gpio_restore_pin(GPIOA, 5, &pa5_cfg);
+    gpio_restore_pin(GPIOA, 6, &pa6_cfg);
+
+    exti_enable_group();
+
+    /* Debug print */
+    float ones_pct = (rx_samples > 0u) ? (100.0f * (float)rx_ones / (float)rx_samples) : 0.0f;
+
+    printf("[AUD] TX: bitbang SCK target=%lu Hz, duration=%lu ms, cycles=%lu\r\n",
+           (unsigned long)MIC_BB_FREQ_HZ,
+           (unsigned long)MIC_BB_DURATION_MS,
+           (unsigned long)tx_cycles);
+
+    printf("[AUD] RX: samples=%lu, ones=%.2f%%, transitions=%lu\r\n",
+           (unsigned long)rx_samples,
+           (double)ones_pct,
+           (unsigned long)rx_trans);
+
+    /* Decide states */
+    if (rx_trans == 0u) {
+        if (rx_ones == 0u) {
+            printf("[AUD] RESULT: DATA constant LOW (no activity)\r\n");
+        } else if (rx_ones == rx_samples) {
+            printf("[AUD] RESULT: DATA constant HIGH (no activity)\r\n");
+        } else {
+            printf("[AUD] RESULT: DATA constant (no transitions)\r\n");
+        }
+        return 0.0f; // mic "neposiela" => presne 0%
+    }
+
+    /* Activity percentage: how often it changes (rough) */
+    float activity = 100.0f * (float)rx_trans / (float)(rx_samples - 1u);
+    if (activity < 0.0f) activity = 0.0f;
+    if (activity > 100.0f) activity = 100.0f;
+
+    printf("[AUD] RESULT: DATA ACTIVE, activity=%.2f%%\r\n", (double)activity);
+    return activity;
+}

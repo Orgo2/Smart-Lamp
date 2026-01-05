@@ -1,0 +1,7 @@
+../Drivers/Project_drv/led.c:9:6:led_hw_status	1
+../Drivers/Project_drv/led.c:44:20:put_byte_msb	3
+../Drivers/Project_drv/led.c:52:6:led_set_RGBW	2
+../Drivers/Project_drv/led.c:61:6:led_set_RGB	1
+../Drivers/Project_drv/led.c:66:6:led_set_all_RGBW	2
+../Drivers/Project_drv/led.c:73:6:led_set_all_RGB	1
+../Drivers/Project_drv/led.c:84:6:led_render	3

@@ -1,0 +1,7 @@
+../Drivers/Project_drv/rtc.c:32:19:RTC_Init	8	static
+../Drivers/Project_drv/rtc.c:39:19:RTC_ReadClock	80	static
+../Drivers/Project_drv/rtc.c:74:19:RTC_SetClock	88	static
+../Drivers/Project_drv/rtc.c:125:19:RTC_SetAlarm	96	static
+../Drivers/Project_drv/rtc.c:195:19:RTC_SetDailyAlarm	80	static
+../Drivers/Project_drv/rtc.c:261:19:RTC_GetDailyAlarm	24	static
+../Drivers/Project_drv/rtc.c:286:6:HAL_RTC_AlarmAEventCallback	120	static

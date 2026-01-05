@@ -1,0 +1,243 @@
+/*
+ * ANALOG Driver - Integrácia do main.c
+ * 
+ * POZNÁMKA: Toto je len PRÍKLAD pre dokumentáciu!
+ * NIE JE URČENÝ NA KOMPILÁCIU - je to šablóna/dokumentácia.
+ * 
+ * Ak chceš použiť tieto príklady, skopíruj potrebný kód do MAIN.C
+ * Aktuálny main.c už obsahuje plne funkčný command-line interface!
+ */
+
+// ====================================
+// 1. INCLUDE NA ZAČIATKU main.c
+// ====================================
+/* USER CODE BEGIN Includes */
+#include "led.h"
+#include "alarm.h"
+#include "analog.h"  // <- PRIDAJTE TENTO RIADOK
+/* USER CODE END Includes */
+
+
+// ====================================
+// 2. INICIALIZÁCIA V main() FUNKCII
+// ====================================
+int main(void)
+{
+  // ... HAL_Init(), SystemClock_Config(), atď. ...
+  
+  /* USER CODE BEGIN 2 */
+  
+  // Inicializovať LED driver
+  LED_Init(&hlptim2, LPTIM_CHANNEL_1);
+  
+  // Inicializovať BEEP driver
+  BEEP_Init(&hlptim3, LPTIM_CHANNEL_3);
+  
+  // Inicializovať ANALOG driver
+  ANALOG_Init(&hadc1);  // <- PRIDAJTE TENTO RIADOK
+  
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    
+    // --- PRÍKLAD 1: Jednoduché meranie a výpis ---
+    float svetlo = ANALOG_GetLight();
+    float bateria = ANALOG_GetBat();
+    
+    printf("Svetlo: %.1f lux | Batéria: %.2f V\n", svetlo, bateria);
+    
+    
+    // --- PRÍKLAD 2: Automatické ovládanie LED podľa svetla ---
+    if (svetlo < 50.0f)
+    {
+      // Je tma - zapnúť LED na maximum
+      LED_SetBrightness(100);
+    }
+    else if (svetlo < 200.0f)
+    {
+      // Slabé svetlo - stredná intenzita
+      LED_SetBrightness(50);
+    }
+    else if (svetlo < 500.0f)
+    {
+      // Dobré svetlo - nízka intenzita
+      LED_SetBrightness(20);
+    }
+    else
+    {
+      // Jasné svetlo - vypnúť LED
+      LED_SetBrightness(0);
+    }
+    
+    
+    // --- PRÍKLAD 3: Upozornenie pri nízkej batérii ---
+    if (bateria < 3.3f)
+    {
+      // Kriticky nízka batéria - bzučiak a červená LED
+      BEEP_Beep(1000, 100);  // 1000 Hz, 100 ms
+      // Nastavte červenú farbu LED (príklad)
+      // LED_SetColor(255, 0, 0);
+    }
+    else if (bateria < 3.5f)
+    {
+      // Nízka batéria - krátky bzučiak
+      BEEP_Beep(800, 50);
+    }
+    
+    
+    // --- PRÍKLAD 4: Meranie len keď je potrebné (šetrenie energie) ---
+    // Merať len každých 10 sekúnd
+    static uint32_t last_measurement = 0;
+    if (HAL_GetTick() - last_measurement > 10000)
+    {
+      svetlo = ANALOG_GetLight();
+      bateria = ANALOG_GetBat();
+      last_measurement = HAL_GetTick();
+      
+      // Uložiť do premenných alebo poslať cez USB
+    }
+    
+    
+    HAL_Delay(1000);
+  }
+  /* USER CODE END 3 */
+}
+
+
+// ====================================
+// KOMPLETNÝ PRÍKLAD S VŠETKÝMI FUNKCIAMI
+// ====================================
+
+/*
+#include "analog.h"
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_I2C1_Init();
+  MX_SPI1_Init();
+  MX_TIM2_Init();
+  MX_USB_PCD_Init();
+  MX_USBX_Device_Init();
+  MX_CRC_Init();
+  MX_LPTIM2_Init();
+  MX_LPTIM3_Init();
+  MX_RTC_Init();
+  
+  // Inicializovať všetky drivery
+  LED_Init(&hlptim2, LPTIM_CHANNEL_1);
+  BEEP_Init(&hlptim3, LPTIM_CHANNEL_3);
+  ANALOG_Init(&hadc1);
+  
+  // Premenné pre meranie
+  float light_lux = 0.0f;
+  float battery_v = 0.0f;
+  
+  while (1)
+  {
+    // Meranie každú sekundu
+    light_lux = ANALOG_GetLight();
+    battery_v = ANALOG_GetBat();
+    
+    // Logika inteligentnej lampy
+    
+    // 1. Automatické osvetlenie podľa svetla
+    if (light_lux < 100.0f)
+    {
+      LED_SetBrightness(100);  // Tma -> plná intenzita
+    }
+    else
+    {
+      LED_SetBrightness(0);    // Svetlo -> vypnuté
+    }
+    
+    // 2. Upozornenie na batériu
+    if (battery_v < 3.3f)
+    {
+      BEEP_Beep(1000, 100);
+    }
+    
+    // 3. USB výpis pre debugging
+    printf("L: %.0f lux, B: %.2fV\n", light_lux, battery_v);
+    
+    HAL_Delay(1000);
+  }
+}
+*/
+
+// ====================================
+// POKROČILÝ PRÍKLAD: State Machine
+// ====================================
+
+/*
+typedef enum {
+  LAMP_OFF,
+  LAMP_AUTO,
+  LAMP_MANUAL,
+  LAMP_LOW_BATTERY
+} LampState_t;
+
+LampState_t lamp_state = LAMP_AUTO;
+
+void SmartLamp_Task(void)
+{
+  static uint32_t last_check = 0;
+  
+  // Merať každých 500ms
+  if (HAL_GetTick() - last_check < 500) return;
+  last_check = HAL_GetTick();
+  
+  float light = ANALOG_GetLight();
+  float battery = ANALOG_GetBat();
+  
+  switch (lamp_state)
+  {
+    case LAMP_AUTO:
+      // Automatický režim podľa svetla
+      if (light < 50.0f) {
+        LED_SetBrightness(100);
+      } else if (light < 200.0f) {
+        LED_SetBrightness(50);
+      } else if (light < 500.0f) {
+        LED_SetBrightness(20);
+      } else {
+        LED_SetBrightness(0);
+      }
+      
+      // Kontrola batérie
+      if (battery < 3.2f) {
+        lamp_state = LAMP_LOW_BATTERY;
+      }
+      break;
+      
+    case LAMP_MANUAL:
+      // Užívateľské nastavenie (tlačidlá, USB príkazy)
+      // LED ovládané externe
+      break;
+      
+    case LAMP_LOW_BATTERY:
+      // Núdzový režim
+      LED_SetBrightness(10);  // Minimálne svetlo
+      BEEP_Beep(1000, 50);    // Upozornenie
+      
+      if (battery > 3.5f) {
+        lamp_state = LAMP_AUTO;  // Návrat do auto režimu
+      }
+      break;
+      
+    case LAMP_OFF:
+      LED_SetBrightness(0);
+      break;
+  }
+}
+*/
