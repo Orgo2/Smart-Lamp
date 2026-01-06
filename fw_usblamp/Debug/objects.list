@@ -6,6 +6,7 @@
 "./Core/Src/system_stm32u0xx.o"
 "./Core/Src/usb_cli.o"
 "./Core/Startup/startup_stm32u073kcux.o"
+"./Drivers/Project_drv/MiniPascal.o"
 "./Drivers/Project_drv/alarm.o"
 "./Drivers/Project_drv/analog.o"
 "./Drivers/Project_drv/bme280.o"

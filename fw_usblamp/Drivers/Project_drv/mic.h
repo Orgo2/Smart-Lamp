@@ -92,6 +92,9 @@ float MIC_LastDbFS(void);
 /* Posledná vypočítaná "energia" (RMS) z dekódovaného PCM (0..1). */
 float MIC_LastRms(void);
 
+/* Debug: get last DMA buffer for CLI inspection */
+const uint16_t* MIC_DebugLastDmaBuf(uint32_t *out_words);
+
 #ifdef __cplusplus
 }
 #endif

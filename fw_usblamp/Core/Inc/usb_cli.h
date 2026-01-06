@@ -10,6 +10,9 @@ extern "C" {
 void USB_CLI_Init(void);
 void USB_CLI_Task(void);
 
+// CDC write function for use by MiniPascal and other modules
+void cdc_write_str(const char *s);
+
 #ifdef __cplusplus
 }
 #endif

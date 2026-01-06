@@ -68,8 +68,8 @@ all: main-build
 main-build: LAMP_USB.elf secondary-outputs
 
 # Tool invocations
-LAMP_USB.elf LAMP_USB.map: $(OBJS) $(USER_OBJS) C:\Users\orgo\Documents\Rado\lampa\fw_usblamp\STM32U073KCUX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "LAMP_USB.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0plus -T"C:\Users\orgo\Documents\Rado\lampa\fw_usblamp\STM32U073KCUX_FLASH.ld" --specs=nosys.specs -Wl,-Map="LAMP_USB.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
+LAMP_USB.elf LAMP_USB.map: $(OBJS) $(USER_OBJS) C:\Users\orgo\Documents\Rado\lampa\Smart-Lamp\fw_usblamp\STM32U073KCUX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "LAMP_USB.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0plus -T"C:\Users\orgo\Documents\Rado\lampa\Smart-Lamp\fw_usblamp\STM32U073KCUX_FLASH.ld" --specs=nosys.specs -Wl,-Map="LAMP_USB.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

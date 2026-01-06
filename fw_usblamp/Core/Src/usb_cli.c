@@ -9,6 +9,7 @@
 #include "alarm.h"
 #include "rtc.h"
 #include "mic.h"
+#include <MiniPascal.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -48,7 +49,7 @@ static void dbg_led_blink(uint8_t times)
     }
 }
 
-static void cdc_write_str(const char *s)
+void cdc_write_str(const char *s)
 {
     if (s == NULL) return;
     uint32_t sent = 0;
@@ -87,6 +88,9 @@ typedef enum
 
 static pending_cmd_t s_pending_cmd;
 static uint32_t s_pending_start_id;
+
+/* Pascal interpreter mode */
+static uint8_t s_pascal_mode = 0;
 
 static void service_pending_cmd(void)
 {
@@ -128,6 +132,7 @@ static void print_help(void)
         "PRIKAZY:\r\n"
         "  HELP\r\n"
         "  PING\r\n"
+        "  PASCAL                        (spusti Pascal interpreter)\r\n"
         "  LEDSTATUS\r\n"
         "  LEDOFF\r\n"
         "  LEDON [R G B W]\r\n"
@@ -631,6 +636,14 @@ static void handle_line(char *line)
         }
         return;
     }
+
+    /* pascal - enter Pascal interpreter mode */
+    if (strcmp(line, "pascal") == 0 || strcmp(line, "PASCAL") == 0)
+    {
+        s_pascal_mode = 1;
+        mp_start_session();
+        return;
+    }
     
     dbg_led_blink(1);
     cdc_write_str("ERR unknown, type: help\r\n");
@@ -657,6 +670,32 @@ void USB_CLI_Task(void)
 
     /* Allow async replies for single-shot measurements without blocking USB. */
     service_pending_cmd();
+
+    /* If Pascal mode is active, run Pascal task and route input there */
+    if (s_pascal_mode)
+    {
+        mp_task();  /* Run VM time-slice + abort check */
+        
+        /* Check if user typed EXIT or session ended */
+        if (mp_exit_pending() || !mp_is_active())
+        {
+            s_pascal_mode = 0;
+            mp_stop_session();
+            cdc_write_str("\r\nPASCAL EXIT\r\n");
+            cdc_prompt();
+            return;
+        }
+
+        /* Route incoming chars to Pascal */
+        if (USBD_CDC_ACM_Receive(rx, sizeof(rx), &got) == 0 && got > 0)
+        {
+            for (uint32_t i = 0; i < got; i++)
+            {
+                mp_feed_char((char)rx[i]);
+            }
+        }
+        return;
+    }
 
     if (USBD_CDC_ACM_Receive(rx, sizeof(rx), &got) != 0 || got == 0)
         return;

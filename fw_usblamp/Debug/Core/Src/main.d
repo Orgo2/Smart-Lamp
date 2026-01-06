@@ -54,11 +54,11 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../USBX/App/ux_device_descriptors.h ../USBX/Target/ux_stm32_config.h \
  ../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h \
  ../Core/Inc/usb_cli.h \
- C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/led.h \
- C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/analog.h \
- C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/alarm.h \
- C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/charger.h \
- C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/mic.h
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/led.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/analog.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/alarm.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h
 ../Core/Inc/main.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal.h:
 ../Core/Inc/stm32u0xx_hal_conf.h:
@@ -117,8 +117,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../USBX/Target/ux_stm32_config.h:
 ../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h:
 ../Core/Inc/usb_cli.h:
-C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/led.h:
-C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/analog.h:
-C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/alarm.h:
-C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/charger.h:
-C:/Users/orgo/Documents/Rado/lampa/fw_usblamp/Drivers/Project_drv/mic.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/led.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/analog.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/alarm.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h:
