@@ -22,6 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdint.h>
 #include "usb_cli.h"
 #include "led.h"
 #include "analog.h"
@@ -37,6 +38,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+//////////////////flash memory reserved for user software data storage//////////////////////
+extern const uint32_t __flash_data_start__;
+extern const uint32_t __flash_data_end__;
+
+#define FLASH_DATA_START ((uint32_t)&__flash_data_start__)
+#define FLASH_DATA_END   ((uint32_t)&__flash_data_end__)
+#define FLASH_DATA_SIZE  (FLASH_DATA_END - FLASH_DATA_START)
 
 /* USER CODE END PD */
 
@@ -82,6 +90,8 @@ static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 static void JumpToBootloader(void);
 static void CheckBootloaderEntry(void);
+static void BL_Task(void);
+void HAL_SYSTICK_Callback(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -113,9 +123,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  /* Early GPIO init for bootloader check - MX_GPIO_Init will be called again below but that's OK */
+  /* Early GPIO init for bootloader check - MX_GPIO_Init will be called again below but that is OK */
   MX_GPIO_Init();
-  CheckBootloaderEntry();  /* Check if user wants bootloader (BL button held 2s) */
+  CheckBootloaderEntry();  /* Check if user wants bootloader (B2 button held 2s) */
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -134,19 +144,19 @@ int main(void)
   // LED power supply will be enabled via 'ledinit' command
   HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_SET);
   HAL_Delay(100);
-  
+
   // Initialize ANALOG driver (ADC with VREFINT calibration)
   ANALOG_Init(&hadc1);
-  
+
   // Initialize charger driver
   CHARGER_Init();
-  
+
   // Initialize PDM microphone driver (SPI1+DMA). After this, MIC_Task() will process 50ms windows.
   MIC_Init();
-  // MIC_Start() is handled by the driver automatically b needed (powersave/continuous).
+  // MIC_Start() is handled by the driver automatically if needed (powersave/continuous).
 
   USB_CLI_Init();
-  // Inicializuj USB stack len ak je USB_Pin v log. 1
+  // Initialize USB stack only if USB_Pin is high
 
   /* USER CODE END 2 */
 
@@ -160,7 +170,8 @@ int main(void)
       CHARGER_Task();
       BEEP_Task();
       MIC_Task();
-      // Úspora energie: MCU spí, prebudí sa na prerušenie (USB, UART, EXTI...)
+      BL_Task();
+      // Power save: MCU sleeps, wakes on interrupt (USB, UART, EXTI, SysTick...)
       __WFI();
     /* USER CODE END WHILE */
 
@@ -718,11 +729,17 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, CTL_CEN_Pin|CTL_LEN_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : B1_Pin B2_Pin */
-  GPIO_InitStruct.Pin = B1_Pin|B2_Pin;
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : B2_Pin */
+  GPIO_InitStruct.Pin = B2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B2_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_Pin */
   GPIO_InitStruct.Pin = USB_Pin;
@@ -757,44 +774,89 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(BL_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  HAL_NVIC_SetPriority(EXTI2_3_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(EXTI2_3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI2_3_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-///reset mcu pri pripojeni usb napajania -inicializacia usb
+/* B2 hold-to-reset (active high, sampled in SysTick). */
+#define BL_RESET_HOLD_MS 5000u
+static volatile uint32_t s_bl_hold_ms = 0u;
+static volatile uint8_t s_bl_reset_req = 0u;
+static volatile uint8_t s_bl_pressed = 0u;
+
+static void BL_Task(void)
+{
+    if (s_bl_reset_req)
+    {
+        NVIC_SystemReset();
+    }
+}
+
+void HAL_SYSTICK_Callback(void)
+{
+    if (!s_bl_pressed && (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET))
+    {
+        s_bl_pressed = 1u;
+    }
+    else if (s_bl_pressed && (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_RESET))
+    {
+        s_bl_pressed = 0u;
+    }
+
+    if (s_bl_pressed)
+    {
+        if (s_bl_hold_ms < BL_RESET_HOLD_MS) s_bl_hold_ms++;
+        if (s_bl_hold_ms >= BL_RESET_HOLD_MS) s_bl_reset_req = 1u;
+    }
+    else
+    {
+        s_bl_hold_ms = 0u;
+        s_bl_reset_req = 0u;
+    }
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-	static uint8_t usb_reset_done = 0;
+    static uint8_t usb_reset_done = 0;
 
-	if (GPIO_Pin == GPIO_PIN_3)   // PA3 = USB VBUS detect
+    if (GPIO_Pin == B2_Pin)
     {
-        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3) == GPIO_PIN_SET)
+        if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET)
         {
-            /* USB PRIPOJENÉ (5V) */
-            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+            s_bl_pressed = 1u;
+            s_bl_hold_ms = 0u;
+        }
+        else
+        {
+            s_bl_pressed = 0u;
+            s_bl_hold_ms = 0u;
+            s_bl_reset_req = 0u;
+        }
+    }
 
-            /* zabráni opakovanému resetu */
+    if (GPIO_Pin == USB_Pin)
+    {
+        if (HAL_GPIO_ReadPin(USB_GPIO_Port, USB_Pin) == GPIO_PIN_SET)
+        {
+            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
             if (!usb_reset_done)
             {
                 usb_reset_done = 1;
-
-                /* krátka oneskorená stabilizácia (voliteľné) */
-                for (volatile uint32_t i = 0; i < 100000; i++);
-
+                for (volatile uint32_t i = 0; i < 100000; i++) { }
                 NVIC_SystemReset();
             }
         }
         else
         {
-            /* USB ODPOJENÉ - iba vypneme LED, bez resetu */
             HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-            /* Reset flag sa vymaže len pri odpojení, aby sa pri ďalšom pripojení mohol resetovať */
             usb_reset_done = 0;
         }
     }
 }
+
+
 
 /**
  * @brief Jump to STM32 system bootloader
@@ -864,7 +926,7 @@ static void JumpToBootloader(void)
 }
 
 /**
- * @brief Check if BL button is pressed at startup and jump to bootloader
+ * @brief Check if B2 button is pressed at startup and jump to bootloader
  * @note Must be called after MX_GPIO_Init()
  *       - Button pressed: blocks here (no other peripherals init)
  *       - Released before 2s: continues normal boot
@@ -872,10 +934,10 @@ static void JumpToBootloader(void)
  */
 static void CheckBootloaderEntry(void)
 {
-    /* BL_Pin already initialized by MX_GPIO_Init() */
+    /* B2_Pin already initialized by MX_GPIO_Init() */
     
     /* If button not pressed, continue immediately */
-    if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) != GPIO_PIN_SET)
+    if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) != GPIO_PIN_SET)
     {
         return;
     }
@@ -886,7 +948,7 @@ static void CheckBootloaderEntry(void)
     while (1)
     {
         /* Button released - continue normal boot */
-        if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) == GPIO_PIN_RESET)
+        if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_RESET)
         {
             return;  /* Exit and continue with peripheral initialization */
         }

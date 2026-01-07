@@ -9,7 +9,7 @@
   - Abort running program if abort-button held 10s (no MCU reset)
   - "Packet" lines like: LED 1 255 255 255 255 or TIME 12 30 0 or ALARM 7 15
     -> parsed into system variables
-  - EDIT mode ends with the word END (no '.' special char)
+  - EDIT mode ends with the word END. (with '.' special char)
   - SAVE <slot> START compiles + erases slot + saves + runs
 */
 
@@ -52,8 +52,9 @@
 #endif
 
 /* ---------------- Flash layout (STM32U073: 256KB flash, 2KB page) ----------------
-   By default, we reserve the LAST (highest) pages of flash for 3 program slots.
-   You can override these macros to match your linker script/reserved regions.
+   Program slots are stored inside the linker FLASH_DATA region:
+     __flash_data_start__ .. __flash_data_end__ (see .ld)
+   Slot size = region_size / MP_FLASH_SLOT_COUNT, aligned down to page size.
 */
 #ifndef MP_FLASH_TOTAL_SIZE
 #define MP_FLASH_TOTAL_SIZE (256u * 1024u)   /* bytes */
@@ -86,7 +87,7 @@ uint32_t mp_hal_millis(void);
 
 /* Abort button (optional):
    Return 1 if pressed, 0 if not pressed.
-   You can implement this to read PF3 (BL button) with your GPIO config.
+   You can implement this to read PA2 (B2 button) with your GPIO config.
    If you don't implement it, default weak implementation returns 0.
 */
 int mp_hal_abort_pressed(void);
@@ -97,6 +98,9 @@ int mp_hal_abort_pressed(void);
    Builtin IDs are defined by the name->id table in MiniPascal.c.
 */
 int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv);
+
+/* Execute a single builtin call line: NAME(arg,...) -> returns true if handled. */
+bool mp_exec_builtin_line(const char *line, int32_t *ret_out, bool *has_ret);
 
 /* ---------------- Public API ---------------- */
 void mp_init(void);

@@ -16,11 +16,17 @@
 
 /* External peripherals from main.c */
 extern RNG_HandleTypeDef hrng;
+extern const uint32_t __flash_data_start__;
+extern const uint32_t __flash_data_end__;
 
 /* ============================ Minimal utils ============================ */
 static void mp_puts(const char *s){ while (*s) mp_hal_putchar(*s++); }
 static void mp_putcrlf(void){ mp_puts("\r\n"); }
 static void mp_prompt(void);  /* forward declaration */
+static bool is_id0(char c);
+static bool is_idn(char c);
+static int builtin_id(const char *name);
+static void time_update_vars(int32_t *vars);
 
 static int mp_stricmp(const char *a, const char *b){
   while (*a && *b){
@@ -47,6 +53,20 @@ static void mp_itoa(int v, char *out){
   out[i]=0;
 }
 
+static void mp_utoa_hex(uint32_t v, char *out){
+  static const char hex[] = "0123456789ABCDEF";
+  char tmp[9];
+  int n=0;
+  if (v==0){ out[0]='0'; out[1]=0; return; }
+  while (v && n < (int)sizeof(tmp)){
+    tmp[n++] = hex[v & 0xFu];
+    v >>= 4;
+  }
+  int i=0;
+  while (n>0) out[i++] = tmp[--n];
+  out[i]=0;
+}
+
 static bool parse_int(const char **p, int *out){
   while (**p==' '||**p=='\t') (*p)++;
   if (!isdigit((unsigned char)**p) && **p!='-') return false;
@@ -55,6 +75,64 @@ static bool parse_int(const char **p, int *out){
   int v=0;
   while (isdigit((unsigned char)**p)){ v = v*10 + (**p - '0'); (*p)++; }
   *out = v*sign;
+  return true;
+}
+
+bool mp_exec_builtin_line(const char *line, int32_t *ret_out, bool *has_ret){
+  if (!line) return false;
+  const char *p = line;
+  while (*p==' '||*p=='\t') p++;
+  if (!is_id0(*p)) return false;
+
+  char name[MP_NAME_LEN];
+  uint16_t i=0;
+  while (is_idn(*p) && i < (MP_NAME_LEN-1)) name[i++] = *p++;
+  name[i]=0;
+
+  while (*p==' '||*p=='\t') p++;
+  if (*p!='(') return false;
+  p++;
+
+  int32_t argv[8];
+  uint8_t argc=0;
+  while (1){
+    while (*p==' '||*p=='\t') p++;
+    if (*p==')'){ p++; break; }
+    if (argc>=8) return false;
+    int v=0;
+    if (!parse_int(&p, &v)) return false;
+    argv[argc++] = (int32_t)v;
+    while (*p==' '||*p=='\t') p++;
+    if (*p==','){ p++; continue; }
+    if (*p==')'){ p++; break; }
+    return false;
+  }
+
+  while (*p==' '||*p=='\t') p++;
+  if (*p) return false;
+
+  int id = builtin_id(name);
+  if (id < 0) return false;
+
+  bool ret = false;
+  if (id==3 || id==4 || id==5 || id==6 || id==7 || id==8 || id==9 || id==12) ret = true;
+  if (id==11 && argc==0) ret = true;
+  if (has_ret) *has_ret = ret;
+
+  int32_t r = 0;
+  if (id==2){
+    if (argc!=1 || argv[0] < 0) return false;
+    uint32_t ms = (uint32_t)argv[0];
+    uint32_t start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start) < ms){
+      HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    }
+    r = 0;
+  } else {
+    r = mp_user_builtin((uint8_t)id, argc, argv);
+    if (r < 0) return false;
+  }
+  if (ret_out) *ret_out = r;
   return true;
 }
 
@@ -75,14 +153,10 @@ static uint16_t fnv1a16_ci(const char *s){
 #define MP_WEAK
 #endif
 
-/* BL button abort: returns 1 if BL pressed, 0 otherwise */
+/* B2 button abort: returns 1 if B2 pressed, 0 otherwise */
 MP_WEAK int mp_hal_abort_pressed(void){
-  return (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) == GPIO_PIN_SET) ? 1 : 0;
+  return (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET) ? 1 : 0;
 }
-
-/* Abort state tracking */
-static uint32_t g_abort_press_start = 0;
-static bool     g_abort_active = false;
 
 /* ============================ Program storage (editor) ============================ */
 typedef struct {
@@ -160,9 +234,10 @@ enum {
   SV_A0    = 2, SV_A1, SV_A2, SV_A3, SV_A4, SV_A5, SV_A6, SV_A7, /* 2..9 */
   SV_LEDI  = 10, SV_LEDR, SV_LEDG, SV_LEDB, SV_LEDW,             /* 10..14 */
   SV_TIMEH = 15, SV_TIMEM, SV_TIMES,                             /* 15..17 */
-  SV_ALH   = 18, SV_ALM, SV_ALS                                  /* 18..20 */
+  SV_ALH   = 18, SV_ALM, SV_ALS,                                 /* 18..20 */
+  SV_TIMEY = 21, SV_TIMEMO, SV_TIMED                             /* 21..23 */
 };
-#define SYSVAR_COUNT 21
+#define SYSVAR_COUNT 24
 
 static const sysvar_t g_sysvars[] = {
   {"CMDID", SV_CMDID}, {"NARG", SV_NARG},
@@ -171,6 +246,7 @@ static const sysvar_t g_sysvars[] = {
   {"LEDI", SV_LEDI}, {"LEDR", SV_LEDR}, {"LEDG", SV_LEDG}, {"LEDB", SV_LEDB}, {"LEDW", SV_LEDW},
   {"TIMEH", SV_TIMEH}, {"TIMEM", SV_TIMEM}, {"TIMES", SV_TIMES},
   {"ALH", SV_ALH}, {"ALM", SV_ALM}, {"ALS", SV_ALS},
+  {"TIMEY", SV_TIMEY}, {"TIMEMO", SV_TIMEMO}, {"TIMED", SV_TIMED},
 };
 
 static int sysvar_find(const char *name){
@@ -205,15 +281,38 @@ typedef struct {
   const char *s;
   uint16_t pos;
   token_t cur;
+  const uint16_t *line_nos;
+  uint8_t line_count;
+  uint8_t line_idx;
+  uint16_t line_no;
 } lex_t;
 
 static bool is_id0(char c){ return (c=='_') || isalpha((unsigned char)c); }
 static bool is_idn(char c){ return (c=='_') || isalnum((unsigned char)c); }
 
-static void lex_init(lex_t *lx, const char *s){ lx->s=s; lx->pos=0; memset(&lx->cur,0,sizeof(lx->cur)); }
+
+static void lex_init_prog(lex_t *lx, const char *s, const uint16_t *line_nos, uint8_t line_count){
+  lx->s = s;
+  lx->pos = 0;
+  memset(&lx->cur, 0, sizeof(lx->cur));
+  lx->line_nos = line_nos;
+  lx->line_count = line_count;
+  lx->line_idx = 0;
+  lx->line_no = (line_nos && line_count) ? line_nos[0] : 0;
+}
 
 static void lex_skip_ws(lex_t *lx){
-  while (lx->s[lx->pos] && (lx->s[lx->pos]==' ' || lx->s[lx->pos]=='\t' || lx->s[lx->pos]=='\r' || lx->s[lx->pos]=='\n')) lx->pos++;
+  while (lx->s[lx->pos] && (lx->s[lx->pos]==' ' || lx->s[lx->pos]=='\t' || lx->s[lx->pos]=='\r' || lx->s[lx->pos]=='\n')){
+    if (lx->s[lx->pos]=='\n'){
+      if (lx->line_nos && lx->line_count && (uint8_t)(lx->line_idx + 1) < lx->line_count){
+        lx->line_idx++;
+        lx->line_no = lx->line_nos[lx->line_idx];
+      } else if (!lx->line_nos){
+        lx->line_no++;
+      }
+    }
+    lx->pos++;
+  }
 }
 
 static bool kw(const char *id, const char *w){
@@ -383,7 +482,8 @@ static int builtin_id(const char *name){
   if (!mp_stricmp(name,"press")) return 7;
   if (!mp_stricmp(name,"btn"))   return 8;
   if (!mp_stricmp(name,"mic"))   return 9;
-  if (!mp_stricmp(name,"settime")) return 10; /* settime(h,m,s) */
+  if (!mp_stricmp(name,"time")) return 10; /* time() or time(yy,mo,dd,hh,mm) */
+  if (!mp_stricmp(name,"settime")) return 10; /* alias */
   if (!mp_stricmp(name,"setalarm"))return 11; /* setalarm(h,m,s) */
   if (!mp_stricmp(name,"alarm")) return 11; /* alias for setalarm */
   if (!mp_stricmp(name,"light")) return 12;
@@ -394,8 +494,27 @@ static int builtin_id(const char *name){
 }
 
 /* -------- Recursive descent expression -------- */
-typedef struct { lex_t lx; program_t *p; int line; } Ctx;
-static void nx(Ctx *c){ lex_next(&c->lx); }
+typedef struct {
+  lex_t lx;
+  program_t *p;
+  int line;
+  uint8_t line_count;
+  int16_t last_line_idx;
+} Ctx;
+static void nx(Ctx *c){
+  lex_next(&c->lx);
+  if (c->line_count && c->p){
+    int16_t cur = (int16_t)c->lx.line_idx;
+    if (c->last_line_idx != cur){
+      int16_t from = (c->last_line_idx < 0) ? 0 : (int16_t)(c->last_line_idx + 1);
+      for (int16_t i = from; i <= cur && i < (int16_t)c->line_count; i++){
+        if (c->p->line_addr[i] == 0xFFFFu) c->p->line_addr[i] = c->p->len;
+      }
+      c->last_line_idx = cur;
+    }
+  }
+  c->line = c->lx.line_no;
+}
 static bool ac(Ctx *c, tok_t k){ if (c->lx.cur.k==k){ nx(c); return true; } return false; }
 static bool ex(Ctx *c, tok_t k, const char *msg){ if (ac(c,k)) return true; set_err(msg,c->line); return false; }
 
@@ -640,27 +759,18 @@ static bool stmt(Ctx *c){
     if(!stmt_list_until(c, T_END)) return false;
     return ex(c, T_END, "expected 'end'");
   }
+  if (ac(c, T_END)) return true;
 
   if (c->lx.cur.k == T_ID) return st_assign_or_call(c);
-  return true;
+  set_err("expected statement", c->line);
+  return false;
 }
 
-static bool compile_line(program_t *p, int line_no, const char *text){
-  Ctx c; memset(&c,0,sizeof(c));
-  c.p = p; c.line = line_no;
-  lex_init(&c.lx, text);
-  nx(&c);
-  if(!stmt_list_until(&c, T_EOF)) return false;
-  return true;
-}
-
-static int editor_index_by_line(const mp_editor_t *ed, uint16_t line_no){
-  for (uint8_t i=0;i<ed->count;i++) if (ed->lines[i].line_no == (int)line_no) return i;
-  return -1;
-}
+static int editor_index_by_line(const mp_editor_t *ed, uint16_t line_no);
 
 static bool compile_program(const mp_editor_t *ed, program_t *out){
   memset(out, 0, sizeof(*out));
+  for (uint8_t i=0;i<MP_MAX_LINES;i++) out->line_addr[i]=0xFFFFu;
   g_err=0; g_err_line=-1;
 
   if (MP_MAX_VARS < SYSVAR_COUNT + 8){
@@ -668,15 +778,41 @@ static bool compile_program(const mp_editor_t *ed, program_t *out){
     return false;
   }
 
-  for (uint8_t i=0;i<ed->count;i++){
-    out->line_addr[i] = out->len;
-    if(!compile_line(out, ed->lines[i].line_no, ed->lines[i].text)){
-      if(!g_err) set_err("compile error", ed->lines[i].line_no);
-      break;
-    }
+  if (ed->count == 0){
+    if(!emit_u8(out, OP_HALT)) set_err("bytecode overflow", -1);
+    return (g_err==0);
   }
+
+  char buf[MP_MAX_LINES * MP_LINE_LEN];
+  uint16_t line_nos[MP_MAX_LINES];
+  size_t pos = 0;
+  for (uint8_t i=0;i<ed->count;i++){
+    line_nos[i] = (uint16_t)ed->lines[i].line_no;
+    size_t len = strnlen(ed->lines[i].text, MP_LINE_LEN-1);
+    if (pos + len + 1 >= sizeof(buf)){
+      set_err("program too long", ed->lines[i].line_no);
+      return false;
+    }
+    memcpy(&buf[pos], ed->lines[i].text, len);
+    pos += len;
+    if (i + 1 < ed->count) buf[pos++] = '\n';
+  }
+  buf[pos] = 0;
+
+  Ctx c; memset(&c, 0, sizeof(c));
+  c.p = out;
+  c.line_count = ed->count;
+  c.last_line_idx = -1;
+  lex_init_prog(&c.lx, buf, line_nos, ed->count);
+  nx(&c);
+  if(!stmt_list_until(&c, T_EOF)) return false;
+
   if (!g_err){
     if(!emit_u8(out, OP_HALT)) set_err("bytecode overflow", -1);
+  }
+
+  for (uint8_t i=0;i<ed->count;i++){
+    if (out->line_addr[i] == 0xFFFFu) out->line_addr[i] = out->len;
   }
 
   if (!g_err){
@@ -687,6 +823,11 @@ static bool compile_program(const mp_editor_t *ed, program_t *out){
     }
   }
   return (g_err==0);
+}
+
+static int editor_index_by_line(const mp_editor_t *ed, uint16_t line_no){
+  for (uint8_t i=0;i<ed->count;i++) if (ed->lines[i].line_no == (int)line_no) return i;
+  return -1;
 }
 
 /* ============================ VM ============================ */
@@ -791,7 +932,7 @@ static bool vm_step(vm_t *vm, const program_t *p, uint32_t now_ms, uint16_t max_
   return vm->running;
 }
 
-/* ============================ Flash storage: 3 slots at end of flash ============================ */
+/* ============================ Flash storage: slots inside linker FLASH_DATA region ============================ */
 #define MP_MAGIC 0x4D505033u /* 'MPP3' */
 typedef struct __attribute__((packed)) {
   uint32_t magic;
@@ -809,21 +950,60 @@ static uint32_t fnv1a32_update(uint32_t h, const void *data, uint32_t len){
   return h;
 }
 
-static uint32_t slot_size_bytes(void){
-  return (uint32_t)MP_FLASH_SLOT_PAGES * (uint32_t)MP_FLASH_PAGE_SIZE;
+static uint32_t flash_data_start(void){
+  return (uint32_t)&__flash_data_start__;
 }
 
-static uint32_t flash_end_addr(void){
-  return (uint32_t)FLASH_BASE + (uint32_t)MP_FLASH_TOTAL_SIZE;
+static uint32_t flash_data_end(void){
+  return (uint32_t)&__flash_data_end__;
+}
+
+static uint32_t flash_data_size(void){
+  uint32_t start = flash_data_start();
+  uint32_t end = flash_data_end();
+  return (end > start) ? (end - start) : 0u;
+}
+
+static const char *g_flash_err = 0;
+static uint32_t g_flash_hal_err = 0;
+
+static void flash_err_clear(void){
+  g_flash_err = 0;
+  g_flash_hal_err = 0;
+}
+
+static void flash_err_set(const char *msg){
+  g_flash_err = msg;
+  g_flash_hal_err = HAL_FLASH_GetError();
+}
+
+static void flash_clear_errors(void){
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_OPERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PROGERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_WRPERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGAERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_SIZERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGSERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_MISERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_FASTERR);
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_OPTVERR);
+}
+
+static uint32_t slot_size_bytes(void){
+  uint32_t total = flash_data_size();
+  if (total == 0) return 0u;
+  uint32_t slot = total / (uint32_t)MP_FLASH_SLOT_COUNT;
+  slot = (slot / (uint32_t)MP_FLASH_PAGE_SIZE) * (uint32_t)MP_FLASH_PAGE_SIZE;
+  return slot;
 }
 
 static uint32_t slot_base_addr(uint8_t slot){
   uint32_t ss = slot_size_bytes();
-  uint32_t end = flash_end_addr();
+  uint32_t start = flash_data_start();
   if (slot < 1) slot = 1;
   if (slot > MP_FLASH_SLOT_COUNT) slot = MP_FLASH_SLOT_COUNT;
-  uint32_t offset = ss * (uint32_t)(MP_FLASH_SLOT_COUNT - slot + 1);
-  return end - offset;
+  return start + ss * (uint32_t)(slot - 1);
 }
 
 static bool flash_unlock(void){ return (HAL_FLASH_Unlock()==HAL_OK); }
@@ -846,31 +1026,67 @@ static bool flash_erase_region(uint32_t addr, uint32_t size){
   return (HAL_FLASHEx_Erase(&ei, &page_error) == HAL_OK);
 }
 
-static bool flash_prog_bytes(uint32_t addr, const uint8_t *data, uint32_t len){
-  uint32_t i=0;
-  while (i < len){
-    uint64_t dw = 0xFFFFFFFFFFFFFFFFull;
-    uint8_t *pdw = (uint8_t*)&dw;
-    for (uint32_t k=0;k<8;k++){
-      uint32_t idx=i+k;
-      pdw[k] = (idx < len) ? data[idx] : 0xFF;
+typedef struct {
+  uint32_t addr;
+  uint8_t buf[8];
+  uint8_t fill;
+} flash_stream_t;
+
+static bool flash_prog_dw(uint32_t addr, const uint8_t *buf){
+  uint64_t dw = 0xFFFFFFFFFFFFFFFFull;
+  uint8_t *pdw = (uint8_t*)&dw;
+  for (uint32_t k=0;k<8;k++) pdw[k] = buf[k];
+  return (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, dw) == HAL_OK);
+}
+
+static bool flash_stream_init(flash_stream_t *s, uint32_t base){
+  if (!s || (base & 0x7u)) return false;
+  s->addr = base;
+  s->fill = 0;
+  memset(s->buf, 0xFF, sizeof(s->buf));
+  return true;
+}
+
+static bool flash_stream_write(flash_stream_t *s, const uint8_t *data, uint32_t len){
+  if (!s || !data) return false;
+  for (uint32_t i=0;i<len;i++){
+    s->buf[s->fill++] = data[i];
+    if (s->fill == 8){
+      if (!flash_prog_dw(s->addr, s->buf)) return false;
+      s->addr += 8;
+      s->fill = 0;
+      memset(s->buf, 0xFF, sizeof(s->buf));
     }
-    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, dw) != HAL_OK) return false;
-    addr += 8; i += 8;
   }
   return true;
 }
 
+static bool flash_stream_flush(flash_stream_t *s){
+  if (!s) return false;
+  if (s->fill == 0) return true;
+  if (!flash_prog_dw(s->addr, s->buf)) return false;
+  s->addr += 8;
+  s->fill = 0;
+  memset(s->buf, 0xFF, sizeof(s->buf));
+  return true;
+}
+
 static bool storage_erase_slot(uint8_t slot){
+  flash_err_clear();
   uint32_t base = slot_base_addr(slot);
   uint32_t size = slot_size_bytes();
-  if(!flash_unlock()) return false;
+  if (size == 0){ flash_err_set("slot size"); return false; }
+  if ((base + size) > flash_data_end()){ flash_err_set("slot range"); return false; }
+  flash_clear_errors();
+  if(!flash_unlock()){ flash_err_set("unlock"); return false; }
   bool ok = flash_erase_region(base, size);
+  if (!ok) flash_err_set("erase");
   flash_lock();
   return ok;
 }
 
 static bool storage_save_slot(uint8_t slot, const mp_editor_t *ed, bool autorun){
+  flash_err_clear();
   mp_hdr_t hdr; memset(&hdr,0,sizeof(hdr));
   hdr.magic = MP_MAGIC;
   hdr.version = 2;
@@ -898,21 +1114,38 @@ static bool storage_save_slot(uint8_t slot, const mp_editor_t *ed, bool autorun)
 
   uint32_t total = sizeof(hdr) + data_len;
   uint32_t slot_size = slot_size_bytes();
-  if (total > slot_size) return false;
+  if (slot_size == 0){ flash_err_set("slot size"); return false; }
+  if (total > slot_size){ flash_err_set("too big"); return false; }
 
   uint32_t base = slot_base_addr(slot);
+  if ((base + slot_size) > flash_data_end()){ flash_err_set("slot range"); return false; }
 
-  if(!flash_unlock()) return false;
+  flash_clear_errors();
+  if(!flash_unlock()){ flash_err_set("unlock"); return false; }
   bool ok = flash_erase_region(base, slot_size);
-  if (ok) ok = flash_prog_bytes(base, (const uint8_t*)&hdr, sizeof(hdr));
+  if (!ok){ flash_err_set("erase"); }
 
-  uint32_t addr = base + sizeof(hdr);
+  flash_stream_t fs;
+  if (ok && !flash_stream_init(&fs, base)){
+    flash_err_set("align");
+    ok = false;
+  }
+  if (ok){
+    ok = flash_stream_write(&fs, (const uint8_t*)&hdr, sizeof(hdr));
+    if (!ok) flash_err_set("prog hdr");
+  }
+
   for (uint8_t i=0;i<ed->count && ok;i++){
     uint16_t ln = (uint16_t)ed->lines[i].line_no;
     uint8_t slen = (uint8_t)strnlen(ed->lines[i].text, MP_LINE_LEN-1);
     uint8_t rec_hdr[3] = { (uint8_t)(ln&0xFF), (uint8_t)((ln>>8)&0xFF), slen };
-    ok = flash_prog_bytes(addr, rec_hdr, 3); addr += 3;
-    if (ok){ ok = flash_prog_bytes(addr, (const uint8_t*)ed->lines[i].text, slen); addr += slen; }
+    ok = flash_stream_write(&fs, rec_hdr, 3);
+    if (ok){ ok = flash_stream_write(&fs, (const uint8_t*)ed->lines[i].text, slen); }
+    if (!ok){ flash_err_set("prog data"); }
+  }
+  if (ok && !flash_stream_flush(&fs)){
+    flash_err_set("prog data");
+    ok = false;
   }
 
   flash_lock();
@@ -920,13 +1153,17 @@ static bool storage_save_slot(uint8_t slot, const mp_editor_t *ed, bool autorun)
 }
 
 static bool storage_load_slot(uint8_t slot, mp_editor_t *ed, bool *autorun_out){
+  flash_err_clear();
   uint32_t base = slot_base_addr(slot);
+  uint32_t slot_size = slot_size_bytes();
+  if (slot_size == 0){ flash_err_set("slot size"); return false; }
+  if ((base + slot_size) > flash_data_end()){ flash_err_set("slot range"); return false; }
   const mp_hdr_t *hdr = (const mp_hdr_t*)base;
   if (hdr->magic != MP_MAGIC || hdr->version != 2) return false;
   if (hdr->count > MP_MAX_LINES) return false;
 
   uint32_t total = sizeof(*hdr) + hdr->data_len;
-  if (total > slot_size_bytes()) return false;
+  if (total > slot_size) return false;
 
   mp_hdr_t h0 = *hdr;
   uint32_t stored = h0.checksum;
@@ -973,7 +1210,6 @@ static uint8_t     g_slot=1;
 static bool        g_session_active=false;
 static bool        g_exit_pending=false;
 
-
 static bool g_edit=false;
 static int  g_next_line=10;
 static int  g_step=10;
@@ -993,16 +1229,20 @@ static void mp_prompt(void){
 }
 
 static void help(void){
-  mp_puts("MiniPascal monitor (v4)\r\n");
+  mp_puts("MiniPascal monitor\r\n");
   mp_puts("\r\n");
   mp_puts("=== COMMANDS ===\r\n");
-  mp_puts("  EDIT         enter edit mode (starts new program)\r\n");
-  mp_puts("  END          exit edit mode\r\n");
+  mp_puts("  EDIT         enter edit mode (new program)\r\n");
+  mp_puts("  END.         exit edit mode\r\n");
   mp_puts("  NEW          clear program\r\n");
   mp_puts("  LIST         show program\r\n");
   mp_puts("  RUN          compile and run\r\n");
   mp_puts("  STOP         stop running\r\n");
   mp_puts("  EXIT         exit Pascal mode\r\n");
+  mp_puts("\r\n");
+  mp_puts("=== EDIT MODE ===\r\n");
+  mp_puts("  Type statements without line numbers.\r\n");
+  mp_puts("  (Line numbers are optional and will be stripped.)\r\n");
   mp_puts("\r\n");
   mp_puts("=== FLASH STORAGE ===\r\n");
   mp_puts("  SAVE 1       save to slot 1 (1-3)\r\n");
@@ -1010,17 +1250,18 @@ static void help(void){
   mp_puts("  LOAD 1       load from slot\r\n");
   mp_puts("  ERASE 1      erase slot\r\n");
   mp_puts("\r\n");
-  mp_puts("=== PASCAL FUNCTIONS (use comma separator) ===\r\n");
+  mp_puts("=== PASCAL FUNCTIONS ===\r\n");
   mp_puts("  LED(idx,r,g,b,w)    set LED color (idx 1-12)\r\n");
   mp_puts("  LEDON(r,g,b,w)      set all LEDs on\r\n");
   mp_puts("  LEDOFF()            turn all LEDs off\r\n");
   mp_puts("  WAIT(ms)            delay milliseconds\r\n");
   mp_puts("  DELAY(ms)           same as WAIT\r\n");
-  mp_puts("  BEEP(freq,vol,s)    beep tone (vol 0-50)\r\n");
+  mp_puts("  BEEP(freq,vol,ms)   beep tone (vol 0-50)\r\n");
   mp_puts("  GOTO n              jump to line n\r\n");
-  mp_puts("  SETTIME(h,m,s)      set RTC time\r\n");
-  mp_puts("  SETALARM(h,m,s)     set alarm\r\n");
-  mp_puts("  ALARM(h,m,s)        alias for SETALARM\r\n");
+  mp_puts("  TIME()              update TIMEY/TIMEMO/TIMED/TIMEH/TIMEM\r\n");
+  mp_puts("  TIME(yy,mo,dd,hh,mm) set RTC date/time\r\n");
+  mp_puts("  SETTIME(...)        alias for TIME\r\n");
+  mp_puts("  ALARM(h,m,s)        set alarm\r\n");
   mp_puts("  ALARM()             read alarm state (0/1)\r\n");
   mp_puts("\r\n");
   mp_puts("=== READ FUNCTIONS (return value) ===\r\n");
@@ -1033,12 +1274,37 @@ static void help(void){
   mp_puts("  BTN()        button state\r\n");
   mp_puts("  MIC()        microphone level\r\n");
   mp_puts("\r\n");
-  mp_puts("=== VARIABLES ===\r\n");
-  mp_puts("  x = 5        assign\r\n");
-  mp_puts("  x = x + 1    expression\r\n");
-  mp_puts("  IF x>5 THEN GOTO 100\r\n");
+  mp_puts("=== FLOW CONTROL ===\r\n");
+  mp_puts("  10 x:=1\r\n");
+  mp_puts("  20 if (x>0) then led(1,255,0,0,0)\r\n");
+  mp_puts("  30 end\r\n");
   mp_puts("\r\n");
-  mp_puts("Tip: hold BL 10s to ABORT stuck program\r\n");
+  mp_puts("  10 x:=1\r\n");
+  mp_puts("  20 if (x>0) then begin\r\n");
+  mp_puts("  30 led(1,255,0,0,0)\r\n");
+  mp_puts("  40 end\r\n");
+  mp_puts("  50 end\r\n");
+  mp_puts("\r\n");
+  mp_puts("  10 x:=3\r\n");
+  mp_puts("  20 while (x>0) do begin\r\n");
+  mp_puts("  30 led(x,255,0,0,0)\r\n");
+  mp_puts("  40 x:=x-1\r\n");
+  mp_puts("  50 end\r\n");
+  mp_puts("  60 end\r\n");
+  mp_puts("\r\n");
+  mp_puts("  10 x:=3\r\n");
+  mp_puts("  20 repeat\r\n");
+  mp_puts("  30 x:=x-1\r\n");
+  mp_puts("  40 until (x<1)\r\n");
+  mp_puts("  50 end\r\n");
+  mp_puts("\r\n");
+  mp_puts("=== VARIABLES ===\r\n");
+  mp_puts("  x := 5       assign\r\n");
+  mp_puts("  x := x + 1   expression\r\n");
+  mp_puts("  IF x>5 THEN GOTO 100\r\n");
+  mp_puts("  TIME() then TIMEY/TIMEMO/TIMED/TIMEH/TIMEM\r\n");
+  mp_puts("\r\n");
+  mp_puts("Tip: hold B2 5s to reset MCU\r\n");
 }
 static void compile_or_report(void){
   g_have_prog=false;
@@ -1068,25 +1334,37 @@ static void cmd_stop(void){
 }
 
 static void handle_edit_line(const char *line){
-  /* In EDIT mode we do NOT use special characters like '.' to terminate,
-     because beginners might accidentally use them inside code.
-     So we use a simple word on its own line: END
-       - END exits EDIT mode and returns to the normal prompt.
-  */
-  if (!mp_stricmp(line, "END")){
+  /* In EDIT mode, END. finishes editing (so END can be used in code). */
+  if (!mp_stricmp(line, "END.")){
     g_edit=false;
     mp_puts("EDIT OFF\r\n");
     return;
   }
 
-  /* Store the line at the current auto line number. */
-  if (!ed_set(&g_ed, g_next_line, line)){
+  int line_no = g_next_line;
+  const char *p = line;
+  while (*p==' '||*p=='\t') p++;
+  int ln=0;
+  const char *p_num = p;
+  if (parse_int(&p_num,&ln)){
+    if (*p_num==' '||*p_num=='\t'){
+      while (*p_num==' '||*p_num=='\t') p_num++;
+      if (ln > 0){
+        line_no = ln;
+        line = p_num;
+      }
+    }
+  }
+
+  /* Store the line at the current (or provided) line number. */
+  if (!ed_set(&g_ed, line_no, line)){
     mp_puts("ERR: Line store failed");
     return;
   }
 
   /* Move to next line number - no confirmation, just next prompt */
-  g_next_line += g_step;
+  if (line_no == g_next_line) g_next_line += g_step;
+  else g_next_line = line_no + g_step;
 }
 
 static bool parse_slot_opt(const char *args, uint8_t *slot_out){
@@ -1098,67 +1376,12 @@ static bool parse_slot_opt(const char *args, uint8_t *slot_out){
   return true;
 }
 
-static void sv_set(uint8_t idx, int32_t v){
-  if (idx < MP_MAX_VARS) g_vm.vars[idx]=v;
-}
-static void sv_set_a(uint8_t n, int32_t v){
-  if (n<8) sv_set((uint8_t)(SV_A0 + n), v);
-}
 
-static void packet_apply_named(const char *word, const int32_t *vals, uint8_t n){
-  sv_set(SV_NARG, n);
-  for (uint8_t i=0;i<8;i++) sv_set_a(i, (i<n)?vals[i]:0);
 
-  if (!mp_stricmp(word,"LED")){
-    sv_set(SV_CMDID, 1);
-    if (n>=1) sv_set(SV_LEDI, vals[0]);
-    if (n>=2) sv_set(SV_LEDR, vals[1]);
-    if (n>=3) sv_set(SV_LEDG, vals[2]);
-    if (n>=4) sv_set(SV_LEDB, vals[3]);
-    if (n>=5) sv_set(SV_LEDW, vals[4]);
-    return;
-  }
-  if (!mp_stricmp(word,"TIME")){
-    sv_set(SV_CMDID, 2);
-    if (n>=1) sv_set(SV_TIMEH, vals[0]);
-    if (n>=2) sv_set(SV_TIMEM, vals[1]);
-    if (n>=3) sv_set(SV_TIMES, vals[2]);
-    return;
-  }
-  if (!mp_stricmp(word,"ALARM")){
-    sv_set(SV_CMDID, 3);
-    if (n>=1) sv_set(SV_ALH, vals[0]);
-    if (n>=2) sv_set(SV_ALM, vals[1]);
-    if (n>=3) sv_set(SV_ALS, vals[2]); else sv_set(SV_ALS, 0);
-    return;
-  }
 
-  sv_set(SV_CMDID, (int32_t)fnv1a16_ci(word));
-}
 
-static bool try_parse_packet(const char *line){
-  char word[MP_NAME_LEN]={0};
-  int wi=0;
-  while (*line==' '||*line=='\t') line++;
-  if (!isalpha((unsigned char)*line)) return false;
-  while (*line && !isspace((unsigned char)*line) && wi < (MP_NAME_LEN-1)){
-    word[wi++] = *line++;
-  }
-  word[wi]=0;
 
-  int32_t vals[8]; uint8_t n=0;
-  const char *p=line;
-  while (n<8){
-    int v=0;
-    if (!parse_int(&p,&v)) break;
-    vals[n++] = (int32_t)v;
-  }
-  if (n==0) return false;
 
-  packet_apply_named(word, vals, n);
-  mp_puts("PKT OK\r\n");
-  return true;
-}
 
 static void handle_line(char *line){
   while (*line==' '||*line=='\t') line++;
@@ -1241,7 +1464,18 @@ static void handle_line(char *line){
         g_session_active=false; /* drop back to caller */
       }
     } else {
-      mp_puts("SAVE FAIL\r\n");
+      mp_puts("SAVE FAIL");
+      if (g_flash_err){
+        mp_puts(": ");
+        mp_puts(g_flash_err);
+        if (g_flash_hal_err){
+          mp_puts(" err=0x");
+          char b[12];
+          mp_utoa_hex(g_flash_hal_err, b);
+          mp_puts(b);
+        }
+      }
+      mp_putcrlf();
       g_autorun = old_ar;
     }
     return;
@@ -1276,7 +1510,7 @@ static void handle_line(char *line){
     ed_init(&g_ed);  /* Clear previous code */
     g_edit=true;
     g_next_line = 10;
-    mp_puts("NEW PROGRAM (type END to finish)\r\n");
+    mp_puts("NEW PROGRAM (type END. to finish, no line numbers)\r\n");
     return;
   }
 
@@ -1299,7 +1533,21 @@ static void handle_line(char *line){
     return;
   }
 
-  if (try_parse_packet(line)) return;
+  {
+    int32_t ret = 0;
+    bool has_ret = false;
+    if (mp_exec_builtin_line(line, &ret, &has_ret)){
+      if (has_ret){
+        char b[16];
+        mp_itoa(ret, b);
+        mp_puts(b);
+        mp_putcrlf();
+      } else {
+        mp_puts("OK\r\n");
+      }
+      return;
+    }
+  }
 
   mp_puts("Unknown command. Type HELP\r\n");
 }
@@ -1395,25 +1643,13 @@ void mp_task(void){ mp_poll(); if (g_exit_pending) g_session_active=false; }
 
 void mp_poll(void){
   uint32_t now = mp_hal_millis();
-  
-  /* Check BL abort button: 10 second hold to stop program */
-  if (g_vm.running && g_have_prog){
-    if (mp_hal_abort_pressed()){
-      if (!g_abort_active){
-        g_abort_active = true;
-        g_abort_press_start = now;
-      } else {
-        if ((now - g_abort_press_start) >= MP_ABORT_HOLD_MS){
-          g_vm.stop_req = true;
-          g_abort_active = false;
-          mp_puts("\r\nABORT (BL held 10s)\r\n");
-        }
-      }
-    } else {
-      g_abort_active = false;
-    }
-  }
 
+  static uint32_t last_time_ms = 0;
+  if ((uint32_t)(now - last_time_ms) >= 1000u){
+    last_time_ms = now;
+    time_update_vars(g_vm.vars);
+  }
+  
   if (g_vm.running && g_have_prog && g_vm.stop_req){
     g_vm.running = false;
     g_vm.sleeping = false;
@@ -1495,6 +1731,28 @@ void mp_buttons_poll(void){
   b2_last = b2;
 }
 
+static bool time_read_ymdhms(int *yy, int *mo, int *dd, int *hh, int *mm, int *ss){
+  if (!yy || !mo || !dd || !hh || !mm || !ss) return false;
+  char dt[RTC_DATETIME_STRING_SIZE];
+  if (RTC_ReadClock(dt) != HAL_OK) return false;
+  int t_h=0,t_m=0,t_s=0,t_y=0,t_mo=0,t_d=0;
+  if (sscanf(dt, "%02d:%02d:%02d_%02d.%02d.%02d", &t_h,&t_m,&t_s,&t_y,&t_mo,&t_d) != 6) return false;
+  *yy = t_y; *mo = t_mo; *dd = t_d; *hh = t_h; *mm = t_m; *ss = t_s;
+  return true;
+}
+
+static void time_update_vars(int32_t *vars){
+  if (!vars) return;
+  int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
+  if (!time_read_ymdhms(&yy,&mo,&dd,&hh,&mm,&ss)) return;
+  vars[SV_TIMEY] = yy;
+  vars[SV_TIMEMO] = mo;
+  vars[SV_TIMED] = dd;
+  vars[SV_TIMEH] = hh;
+  vars[SV_TIMEM] = mm;
+  vars[SV_TIMES] = ss;
+}
+
 /* ============================ Builtin functions ============================ */
 int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
   switch(id){
@@ -1559,17 +1817,33 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         float db=MIC_LastDbFS();
         return (int32_t)(db*100.0f);
       }
-    case 10: /* settime(h,m,s) */
-      if (argc==3){
+    case 10: /* time() or time(yy,mo,dd,hh,mm) */
+      if (argc==0){
+        time_update_vars(g_vm.vars);
+        return 0;
+      }
+      if (argc==5){
+        uint8_t yy = (argv[0]<0)?0:(argv[0]>99?99:(uint8_t)argv[0]);
+        uint8_t mo = (argv[1]<1)?1:(argv[1]>12?12:(uint8_t)argv[1]);
+        uint8_t dd = (argv[2]<1)?1:(argv[2]>31?31:(uint8_t)argv[2]);
+        uint8_t hh = (argv[3]<0)?0:(argv[3]>23?23:(uint8_t)argv[3]);
+        uint8_t mm = (argv[4]<0)?0:(argv[4]>59?59:(uint8_t)argv[4]);
         char buf[RTC_DATETIME_STRING_SIZE];
-        /* Keep date unchanged: read current, replace HMS */
-        char dt[RTC_DATETIME_STRING_SIZE];
-        if (RTC_ReadClock(dt)==HAL_OK){
-          int hh,mm,ss,yy,mo,dd;
-          if (sscanf(dt, "%02d:%02d:%02d_%02d.%02d.%02d", &hh,&mm,&ss,&yy,&mo,&dd)==6){
-            snprintf(buf,sizeof(buf), "%02ld:%02ld:%02ld_%02d.%02d.%02d", (long)argv[0], (long)argv[1], (long)argv[2], yy, mo, dd);
-            if (RTC_SetClock(buf)==HAL_OK) return 0;
-          }
+        snprintf(buf,sizeof(buf), "%02u:%02u:%02u_%02u.%02u.%02u", hh, mm, 0u, yy, mo, dd);
+        if (RTC_SetClock(buf)==HAL_OK){
+          time_update_vars(g_vm.vars);
+          return 0;
+        }
+        return -1;
+      }
+      if (argc==3){
+        int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
+        if (!time_read_ymdhms(&yy,&mo,&dd,&hh,&mm,&ss)) return -1;
+        char buf[RTC_DATETIME_STRING_SIZE];
+        snprintf(buf,sizeof(buf), "%02ld:%02ld:%02ld_%02d.%02d.%02d", (long)argv[0], (long)argv[1], (long)argv[2], yy, mo, dd);
+        if (RTC_SetClock(buf)==HAL_OK){
+          time_update_vars(g_vm.vars);
+          return 0;
         }
       }
       return -1;
@@ -1614,17 +1888,17 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         return 0;
       }
       return -1;
-    case 15: /* beep(freq,vol,s) */
+    case 15: /* beep(freq,vol,ms) */
       if (argc==3){
         int32_t f = argv[0];
         int32_t v = argv[1];
-        int32_t s = argv[2];
+        int32_t ms = argv[2];
         if (f < 1) f = 1;
         if (f > 20000) f = 20000;
         if (v < 0) v = 0;
         if (v > 50) v = 50;
-        if (s < 0) s = 0;
-        BEEP((uint16_t)f, (uint8_t)v, (float)s);
+        if (ms < 0) ms = 0;
+        BEEP((uint16_t)f, (uint8_t)v, (float)ms / 1000.0f);
         return 0;
       }
       return -1;
