@@ -27,6 +27,8 @@ static bool is_id0(char c);
 static bool is_idn(char c);
 static int builtin_id(const char *name);
 static void time_update_vars(int32_t *vars);
+static void time_print_ymdhm(void);
+static bool is_time0_call(const char *line);
 
 static int mp_stricmp(const char *a, const char *b){
   while (*a && *b){
@@ -51,6 +53,14 @@ static void mp_itoa(int v, char *out){
   if (neg) out[i++]='-';
   while (n>0) out[i++] = tmp[--n];
   out[i]=0;
+}
+
+static void mp_put2(uint8_t v){
+  char b[3];
+  b[0] = (char)('0' + ((v / 10u) % 10u));
+  b[1] = (char)('0' + (v % 10u));
+  b[2] = 0;
+  mp_puts(b);
 }
 
 static void mp_utoa_hex(uint32_t v, char *out){
@@ -1258,7 +1268,8 @@ static void help(void){
   mp_puts("  DELAY(ms)           same as WAIT\r\n");
   mp_puts("  BEEP(freq,vol,ms)   beep tone (vol 0-50)\r\n");
   mp_puts("  GOTO n              jump to line n\r\n");
-  mp_puts("  TIME()              update TIMEY/TIMEMO/TIMED/TIMEH/TIMEM\r\n");
+  mp_puts("  TIME()              update TIMEY/TIMEMO/TIMED/TIMEH/TIMEM (and TIMES)\r\n");
+  mp_puts("  TIME() in CLI prints: YY,MM,DD,HH,MM\r\n");
   mp_puts("  TIME(yy,mo,dd,hh,mm) set RTC date/time\r\n");
   mp_puts("  SETTIME(...)        alias for TIME\r\n");
   mp_puts("  ALARM(h,m,s)        set alarm\r\n");
@@ -1542,6 +1553,8 @@ static void handle_line(char *line){
         mp_itoa(ret, b);
         mp_puts(b);
         mp_putcrlf();
+      } else if (is_time0_call(line)){
+        time_print_ymdhm();
       } else {
         mp_puts("OK\r\n");
       }
@@ -1751,6 +1764,36 @@ static void time_update_vars(int32_t *vars){
   vars[SV_TIMEH] = hh;
   vars[SV_TIMEM] = mm;
   vars[SV_TIMES] = ss;
+}
+
+static void time_print_ymdhm(void){
+  time_update_vars(g_vm.vars);
+  mp_put2((uint8_t)g_vm.vars[SV_TIMEY]); mp_puts(",");
+  mp_put2((uint8_t)g_vm.vars[SV_TIMEMO]); mp_puts(",");
+  mp_put2((uint8_t)g_vm.vars[SV_TIMED]); mp_puts(",");
+  mp_put2((uint8_t)g_vm.vars[SV_TIMEH]); mp_puts(",");
+  mp_put2((uint8_t)g_vm.vars[SV_TIMEM]);
+  mp_putcrlf();
+}
+
+static bool is_time0_call(const char *line){
+  if (!line) return false;
+  const char *p = line;
+  while (*p==' '||*p=='\t') p++;
+  if (!is_id0(*p)) return false;
+  char name[MP_NAME_LEN];
+  uint16_t i=0;
+  while (is_idn(*p) && i < (MP_NAME_LEN-1)) name[i++] = *p++;
+  name[i]=0;
+  if (mp_stricmp(name, "time") != 0) return false;
+  while (*p==' '||*p=='\t') p++;
+  if (*p!='(') return false;
+  p++;
+  while (*p==' '||*p=='\t') p++;
+  if (*p!=')') return false;
+  p++;
+  while (*p==' '||*p=='\t') p++;
+  return (*p==0);
 }
 
 /* ============================ Builtin functions ============================ */
