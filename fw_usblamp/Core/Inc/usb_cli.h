@@ -9,6 +9,9 @@ extern "C" {
 
 void USB_CLI_Init(void);
 void USB_CLI_Task(void);
+uint8_t USB_CLI_IsConnected(void);
+/* Force CLI to treat USB as disconnected (safe to call from IRQ). */
+void USB_CLI_NotifyDetach(void);
 
 // CDC write function for use by MiniPascal and other modules
 void cdc_write_str(const char *s);

@@ -45,11 +45,7 @@ Drivers/Project_drv/charger.o: ../Drivers/Project_drv/charger.c \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_ll_usb.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd_ex.h \
- ../Core/Inc/main.h ../Drivers/Project_drv/analog.h \
- ../Middlewares/ST/usbx/common/core/inc/ux_api.h \
- ../Middlewares/ST/usbx/ports/generic/inc/ux_port.h ../USBX/App/ux_user.h \
- ../Middlewares/ST/usbx/common/core/inc/ux_utility.h \
- ../Middlewares/ST/usbx/common/core/inc/ux_system.h
+ ../Core/Inc/main.h ../Drivers/Project_drv/analog.h
 ../Drivers/Project_drv/charger.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal.h:
 ../Core/Inc/stm32u0xx_hal_conf.h:
@@ -98,8 +94,3 @@ Drivers/Project_drv/charger.o: ../Drivers/Project_drv/charger.c \
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd_ex.h:
 ../Core/Inc/main.h:
 ../Drivers/Project_drv/analog.h:
-../Middlewares/ST/usbx/common/core/inc/ux_api.h:
-../Middlewares/ST/usbx/ports/generic/inc/ux_port.h:
-../USBX/App/ux_user.h:
-../Middlewares/ST/usbx/common/core/inc/ux_utility.h:
-../Middlewares/ST/usbx/common/core/inc/ux_system.h:

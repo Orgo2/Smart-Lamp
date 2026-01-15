@@ -60,6 +60,8 @@ void TIM2_IRQHandler(void);
 void TIM7_LPTIM2_IRQHandler(void);
 void SPI1_IRQHandler(void);
 /* USER CODE BEGIN EFP */
+void EXTI0_1_IRQHandler(void);
+void EXTI2_3_IRQHandler(void);
 
 /* USER CODE END EFP */
 

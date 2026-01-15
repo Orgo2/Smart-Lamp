@@ -106,12 +106,15 @@ static uint16_t s_rx_buf[MIC_DMA_WORDS];
 /* riadenie DMA */
 static volatile uint8_t s_spi_done;
 static volatile uint8_t s_spi_err;
+static uint32_t s_dma_t0_ms;
+static uint32_t s_capture_t0_ms;
 
 /* driver state */
 static uint8_t s_inited;
 static uint8_t s_running;
 static uint8_t s_debug;
 static mic_err_t s_last_err;
+static const char *s_last_err_msg;
 
 /* Výsledok posledného okna */
 static float s_last_dbfs = -1.0f;
@@ -131,9 +134,12 @@ static inline uint32_t mic_get_target_ms(void)
     /* 0 = continuous */
     if (MIC_POWERSAVE == 0u) return 0u;
     /* 1..10 = minimum 10ms */
-    if (MIC_POWERSAVE <= 10u) return 10u;
-    /* >10 = ms */
-    return (uint32_t)MIC_POWERSAVE;
+    uint32_t target = (MIC_POWERSAVE <= 10u) ? 10u : (uint32_t)MIC_POWERSAVE;
+
+    /* Ensure at least wake-up + one 50ms window worth of time. */
+    uint32_t min_target = (uint32_t)MIC_WAKEUP_MS + (uint32_t)MIC_WINDOW_MS;
+    if (target < min_target) target = min_target;
+    return target;
 }
 
 /* last DMA snapshot for CLI dump */
@@ -172,6 +178,7 @@ static float safe_dbfs_from_rms(float rms)
 static void set_error(mic_err_t e, const char *msg)
 {
     s_last_err = e;
+    s_last_err_msg = msg;
     if (msg && s_debug)
         printf("[MIC] %s\r\n", msg);
 }
@@ -312,6 +319,7 @@ static mic_err_t start_dma_block(void)
     }
 
     /* Informácia pre debug: BUSY znamená, že SPI generuje CLOCK na PA5 */
+    s_dma_t0_ms = HAL_GetTick();
     MIC_DBG("[MIC] DMA started. SPI state=%d (2=BUSY => CLOCK on PA5)\r\n", (int)HAL_SPI_GetState(&hspi1));
     return MIC_ERR_OK;
 }
@@ -334,6 +342,13 @@ static mic_err_t process_block_and_update_window(void)
     s_have_last_dma = 1u;
     s_last_dma_words = MIC_DMA_WORDS;
 
+    uint8_t in_warmup = 0u;
+    if (MIC_WAKEUP_MS != 0u)
+    {
+        uint32_t elapsed = HAL_GetTick() - s_capture_t0_ms;
+        if (elapsed < (uint32_t)MIC_WAKEUP_MS) in_warmup = 1u;
+    }
+
     /*
      * 1b) Rýchla kontrola kvality dát v tomto DMA bloku.
      *
@@ -354,7 +369,7 @@ static mic_err_t process_block_and_update_window(void)
     }
 
     /* Ak 100% dát je 0x0000 alebo 0xFFFF, DATA je určite stuck */
-    if (bad_count == MIC_DMA_WORDS)
+    if ((!in_warmup) && (bad_count == MIC_DMA_WORDS))
     {
         set_error(MIC_ERR_DATA_STUCK, "ERROR: PDM DATA stuck (all 0x0000 or 0xFFFF)");
         return MIC_ERR_DATA_STUCK;
@@ -375,6 +390,11 @@ static mic_err_t process_block_and_update_window(void)
         }
 
         float s = pdm2pcm_step(cic_in);
+
+        if (in_warmup)
+        {
+            continue;
+        }
 
         /* Akumuluj RMS */
         double sd = (double)s;
@@ -410,6 +430,7 @@ static mic_err_t process_block_and_update_window(void)
             s_last_rms  = rms;
             s_last_dbfs = dbfs;
             s_last_err  = MIC_ERR_OK;
+            s_last_err_msg = NULL;
 
             MIC_DBG("[MIC] 50ms window ready: n=%lu rms=%.4f dbfs=%.2f peak=%.4f\r\n",
                     (unsigned long)s_win_count, (double)rms, (double)dbfs, (double)s_win_peak);
@@ -442,6 +463,9 @@ void MIC_Init(void)
     s_inited = 1u;
     s_running = 0u;
     s_last_err = MIC_ERR_NOT_INIT;
+    s_last_err_msg = "not started";
+    s_dma_t0_ms = 0u;
+    s_capture_t0_ms = 0u;
 
     s_win_count  = 0u;
     s_win_sum_sq = 0.0;
@@ -459,6 +483,7 @@ void MIC_Init(void)
     s_have_last_dma   = 0u;
     s_last_dma_words  = MIC_DMA_WORDS;
 
+    s_capture_t0_ms = s_dma_t0_ms;
     pdm2pcm_reset();
 
     MIC_DBG("[MIC] Init done. Window=%ums, samples=%u, decim=%u\r\n",
@@ -504,26 +529,32 @@ mic_err_t MIC_Start(void)
         /* "neplatný" výsledok, kým interval neskončí */
         s_last_rms  = 0.0f;
         s_last_dbfs = -120.0f;
-        s_last_err  = MIC_ERR_TIMEOUT;
+        s_last_err  = MIC_ERR_NO_DATA_YET;
+        s_last_err_msg = "no data yet";
 
         MIC_DBG("[MIC] PowerSave compile-time: capture %lu ms then stop\r\n", (unsigned long)mic_get_target_ms());
     }
     else
     {
         s_interval_active = 0u;
+        s_last_err = MIC_ERR_NO_DATA_YET;
+        s_last_err_msg = "no data yet";
     }
 
-    set_error(MIC_ERR_OK, NULL);
     return MIC_ERR_OK;
 }
 
 void MIC_Stop(void)
 {
     if (!s_running)
+    {
+        s_interval_active = 0u;
         return;
+    }
 
     (void)HAL_SPI_Abort(&hspi1);
     s_running = 0u;
+    s_interval_active = 0u;
 }
 
 void MIC_Task(void)
@@ -554,7 +585,14 @@ void MIC_Task(void)
 
     /* Ak DMA ešte nedobehlo, nič nerob */
     if (!s_spi_done)
+    {
+        if ((HAL_GetTick() - s_dma_t0_ms) > MIC_TIMEOUT_MS)
+        {
+            set_error(MIC_ERR_TIMEOUT, "ERROR: DMA timeout waiting for RxCplt");
+            MIC_Stop();
+        }
         return;
+    }
 
     /* DMA dobehlo -> spracuj blok */
     (void)process_block_and_update_window();
@@ -614,6 +652,7 @@ void MIC_Task(void)
             s_last_rms  = rms;
             s_last_dbfs = dbfs;
             s_last_err  = MIC_ERR_OK;
+            s_last_err_msg = NULL;
 
             MIC_DBG("[MIC] Interval %lums done: n=%lu rms=%.4f dbfs=%.2f\r\n",
                     (unsigned long)target,
@@ -650,6 +689,7 @@ mic_err_t MIC_GetLast50ms(float *out_dbfs, float *out_rms)
 
 float MIC_LastDbFS(void) { return s_last_dbfs; }
 float MIC_LastRms(void)  { return s_last_rms; }
+const char* MIC_LastErrorMsg(void) { return s_last_err_msg; }
 
 float MIC_ReadDbFS(void)
 {
@@ -680,10 +720,17 @@ float MIC_ReadDbFS_Debug(void)
     while (1)
     {
         MIC_Task();
-        if (s_last_err == MIC_ERR_OK && s_last_dbfs > -200.0f)
+        if (s_last_err == MIC_ERR_OK)
         {
             /* Máme aspoň jedno okno hotové */
             break;
+        }
+
+        if (s_last_err != MIC_ERR_NO_DATA_YET)
+        {
+            MIC_Stop();
+            s_debug = prev_dbg;
+            return -1.0f;
         }
 
         if ((HAL_GetTick() - t0) > 600u)

@@ -16,7 +16,7 @@
 /* Voltage thresholds for charge control (in volts) */
 #define CHARGER_VBAT_STOP       4.1f    /* Stop charging above this voltage */
 #define CHARGER_VBAT_START      3.8f    /* Start charging below this voltage */
-#define CHARGER_VBAT_CRITICAL   2.9f    /* Critical low - disconnect USB */
+#define CHARGER_VBAT_CRITICAL   2.9f    /* Criticaly low, use the lowest rtc standby */
 #define CHARGER_VBAT_RECOVERY   3.1f    /* Recovery threshold - reset MCU if USB connected */
 
 /**

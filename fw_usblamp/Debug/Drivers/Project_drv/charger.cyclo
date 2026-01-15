@@ -1,6 +1,8 @@
-../Drivers/CMSIS/Include/core_cm0plus.h:987:34:__NVIC_SystemReset	1
-../Drivers/Project_drv/charger.c:21:6:CHARGER_Init	1
-../Drivers/Project_drv/charger.c:35:6:CHARGER_Task	11
-../Drivers/Project_drv/charger.c:92:9:CHARGER_IsCharging	1
-../Drivers/Project_drv/charger.c:97:9:CHARGER_GetStatus	4
-../Drivers/Project_drv/charger.c:126:6:CHARGER_Reset	1
+../Core/Inc/main.h:107:20:IND_LED_On	1
+../Core/Inc/main.h:108:20:IND_LED_Off	1
+../Core/Inc/main.h:109:20:IND_LED_Set	2
+../Drivers/Project_drv/charger.c:19:6:CHARGER_Init	1
+../Drivers/Project_drv/charger.c:32:6:CHARGER_Task	9
+../Drivers/Project_drv/charger.c:73:9:CHARGER_IsCharging	1
+../Drivers/Project_drv/charger.c:78:9:CHARGER_GetStatus	4
+../Drivers/Project_drv/charger.c:107:6:CHARGER_Reset	1

@@ -29,6 +29,8 @@
 #include "alarm.h"
 #include "charger.h"
 #include "mic.h"
+#include "MiniPascal.h"
+#include "stm32u0xx_hal_pwr_ex.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,10 +94,20 @@ static void JumpToBootloader(void);
 static void CheckBootloaderEntry(void);
 static void BL_Task(void);
 void HAL_SYSTICK_Callback(void);
+static void LowBattery_Task(void);
+static void LowBattery_EarlyGate(void);
+static void NoProgram_SleepUntilUSB(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* One-shot charger reset on USB attach (helps STNS01 recover from attach glitches). */
+static volatile uint8_t s_usb_chgrst_done = 0u;
+
+/* STOP2 wake bookkeeping (so a short BT1 press reliably starts the lamp after wake). */
+static volatile uint8_t s_stop2_armed = 0u;
+static volatile uint8_t s_stop2_woke_by_b1 = 0u;
 
 /* USER CODE END 0 */
 
@@ -123,9 +135,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  /* Early GPIO init for bootloader check - MX_GPIO_Init will be called again below but that is OK */
+  /* GPIO init for bootloader check (B2 held 2s). */
   MX_GPIO_Init();
-  CheckBootloaderEntry();  /* Check if user wants bootloader (B2 button held 2s) */
+  CheckBootloaderEntry();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -150,13 +162,37 @@ int main(void)
 
   // Initialize charger driver
   CHARGER_Init();
+  if (USB_IsPresent() != 0u)
+  {
+    CHARGER_Reset();
+    s_usb_chgrst_done = 1u;
+  }
+
+  // If battery is critically low (and no USB), park MCU in RTC-standby and retry every 1s
+  LowBattery_EarlyGate();
 
   // Initialize PDM microphone driver (SPI1+DMA). After this, MIC_Task() will process 50ms windows.
   MIC_Init();
   // MIC_Start() is handled by the driver automatically if needed (powersave/continuous).
 
+  //inicialise usb interface comunication
   USB_CLI_Init();
-  // Initialize USB stack only if USB_Pin is high
+  
+  // Initialize MiniPascal interpreter
+  mp_init();
+
+  /* If running on battery and no programs exist, blink and wait in low power until USB is connected. */
+  if ((USB_IsPresent() == 0u) && (mp_first_program_slot() == 0u))
+  {
+    NoProgram_SleepUntilUSB();
+  }
+  else if (USB_IsPresent() == 0u)
+  {
+    /* Battery boot OK: 1x blink 200ms */
+    IND_LED_On();
+    HAL_Delay(200);
+    IND_LED_Off();
+  }
 
   /* USER CODE END 2 */
 
@@ -164,10 +200,50 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      ux_device_stack_tasks_run();
-      USB_CLI_Task();
+      uint8_t usb_pin = USB_IsPresent();
+      static uint8_t s_usb_pin_prev = 0u;
+
+      /* On attach, reset charger once (EXTI attach normally triggers reset; this is a fallback). */
+      if ((s_usb_pin_prev == 0u) && (usb_pin != 0u))
+      {
+        if (!s_usb_chgrst_done)
+        {
+          CHARGER_Reset();
+          s_usb_chgrst_done = 1u;
+        }
+      }
+
+      /* Fallback: if EXTI detach interrupt is missed, still switch to battery mode. */
+      if ((s_usb_pin_prev != 0u) && (usb_pin == 0u))
+      {
+        USB_CLI_NotifyDetach();
+        mp_request_usb_detach();
+        IND_LED_Off();
+        s_usb_chgrst_done = 0u;
+      }
+      s_usb_pin_prev = usb_pin;
+
+      if (usb_pin)
+      {
+        ux_device_stack_tasks_run();
+        USB_CLI_Task();
+      }
+
+      /* USB mode is controlled by USB detect pin. */
+      uint8_t usb_mode = usb_pin;
+      if (!usb_mode)
+      {
+        if (mp_first_program_slot() == 0u)
+        {
+          NoProgram_SleepUntilUSB();
+        }
+        mp_autorun_poll();
+        mp_task();
+        mp_buttons_poll();
+      }
       ANALOG_Task();
       CHARGER_Task();
+      LowBattery_Task();
       BEEP_Task();
       MIC_Task();
       BL_Task();
@@ -501,7 +577,46 @@ static void MX_RTC_Init(void)
   }
 
   /* USER CODE BEGIN Check_RTC_BKUP */
+  const uint32_t rtc_magic = 0x32F2u;
+  if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) != rtc_magic)
+  {
+    /* First-time init only */
+    sTime.Hours = 0x0;
+    sTime.Minutes = 0x0;
+    sTime.Seconds = 0x0;
+    sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+    if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+    sDate.Month = RTC_MONTH_JANUARY;
+    sDate.Date = 0x1;
+    sDate.Year = 0x0;
 
+    if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* Enable the Alarm A */
+    sAlarm.AlarmTime.Hours = 0x0;
+    sAlarm.AlarmTime.Minutes = 0x0;
+    sAlarm.AlarmTime.Seconds = 0x0;
+    sAlarm.AlarmTime.SubSeconds = 0x0;
+    sAlarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY|RTC_ALARMMASK_SECONDS;
+    sAlarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+    sAlarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+    sAlarm.AlarmDateWeekDay = 0x1;
+    sAlarm.Alarm = RTC_ALARM_A;
+    if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BCD) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, rtc_magic);
+  }
   /* USER CODE END Check_RTC_BKUP */
 
   /** Initialize RTC and set the Time and Date
@@ -569,7 +684,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -729,22 +844,16 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, CTL_CEN_Pin|CTL_LEN_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  /*Configure GPIO pins : B1_Pin B2_Pin */
+  GPIO_InitStruct.Pin = B1_Pin|B2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : B2_Pin */
-  GPIO_InitStruct.Pin = B2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_Pin */
   GPIO_InitStruct.Pin = USB_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(USB_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LED_Pin */
@@ -774,46 +883,147 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(BL_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Clear any stale pending EXTI flags before enabling IRQ. */
+  __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
+  __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
+  __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
+  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
   HAL_NVIC_SetPriority(EXTI2_3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI2_3_IRQn);
+
+  /* Default indicator LED to OFF. */
+  IND_LED_Off();
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-/* B2 hold-to-reset (active high, sampled in SysTick). */
-#define BL_RESET_HOLD_MS 5000u
+uint8_t USB_IsPresent(void)
+{
+  return (HAL_GPIO_ReadPin(USB_GPIO_Port, USB_Pin) == GPIO_PIN_SET) ? 1u : 0u;
+}
+
+/* BL hold-to-stop (active high, sampled in SysTick). */
+#define BL_SLEEP_HOLD_MS 2000u
+#define BL_ACTIVE_STATE GPIO_PIN_SET
 static volatile uint32_t s_bl_hold_ms = 0u;
-static volatile uint8_t s_bl_reset_req = 0u;
-static volatile uint8_t s_bl_pressed = 0u;
+static volatile uint8_t s_bl_sleep_req = 0u;
+
+static void Power_MinimizeLoads(void)
+{
+    mp_request_stop();
+
+    /* Try to switch off the LED strip gracefully before cutting its power. */
+    led_set_all_RGBW(0u, 0u, 0u, 0u);
+    led_render();
+
+    HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_RESET);
+    IND_LED_Off();
+}
+
+static void EnterStop(void)
+{
+    Power_MinimizeLoads();
+
+    /* Arm STOP2 wake tracking and clear any stale EXTI flags (prevents immediate wake). */
+    s_stop2_armed = 1u;
+    s_stop2_woke_by_b1 = 0u;
+    __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
+    __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
+    __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
+
+    /* Clear wakeup flag and enter STOP2 mode (wake via EXTI). */
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+
+    /* Reconfigure system clock after STOP2 wakeup. */
+    SystemClock_Config();
+
+    s_stop2_armed = 0u;
+    if (s_stop2_woke_by_b1)
+    {
+        s_stop2_woke_by_b1 = 0u;
+        mp_request_run_loaded();
+    }
+}
+
+static volatile uint8_t s_lamp_off_req = 0u;
+static volatile uint8_t s_lamp_off_stop2 = 0u;
+
+void Lamp_RequestOff(uint8_t enter_stop2)
+{
+    s_lamp_off_req = 1u;
+    s_lamp_off_stop2 = (enter_stop2 != 0u) ? 1u : 0u;
+}
+
+static void Lamp_Off_Task(void)
+{
+    if (!s_lamp_off_req) return;
+    s_lamp_off_req = 0u;
+
+    if (s_lamp_off_stop2)
+    {
+        s_lamp_off_stop2 = 0u;
+        EnterStop(); /* Includes Power_MinimizeLoads() */
+        return;
+    }
+
+    Power_MinimizeLoads();
+}
+
+static void NoProgram_SleepUntilUSB(void)
+{
+    /* Blink 3x so user sees "no program" state (200ms on/off). */
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        IND_LED_On();
+        HAL_Delay(200);
+        IND_LED_Off();
+        HAL_Delay(200);
+    }
+
+    /* Disable button EXTI lines so only USB connect can wake us. */
+    uint32_t imr1 = EXTI->IMR1;
+    EXTI->IMR1 = (imr1 & ~(B1_Pin | B2_Pin)) | USB_Pin;
+    __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
+    __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
+    __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
+
+    /* Wait for USB to be connected. */
+    HAL_SuspendTick();
+    while (USB_IsPresent() == 0u)
+    {
+        Power_MinimizeLoads();
+        __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+        HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+    }
+    HAL_ResumeTick();
+
+    /* Restore EXTI masks (in practice USB attach will trigger reset). */
+    EXTI->IMR1 = imr1;
+}
 
 static void BL_Task(void)
 {
-    if (s_bl_reset_req)
+    if (s_bl_sleep_req)
     {
-        NVIC_SystemReset();
+        s_bl_sleep_req = 0u;
+        EnterStop();
     }
+    Lamp_Off_Task();
 }
 
 void HAL_SYSTICK_Callback(void)
 {
-    if (!s_bl_pressed && (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET))
+    if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) == BL_ACTIVE_STATE)
     {
-        s_bl_pressed = 1u;
-    }
-    else if (s_bl_pressed && (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_RESET))
-    {
-        s_bl_pressed = 0u;
-    }
-
-    if (s_bl_pressed)
-    {
-        if (s_bl_hold_ms < BL_RESET_HOLD_MS) s_bl_hold_ms++;
-        if (s_bl_hold_ms >= BL_RESET_HOLD_MS) s_bl_reset_req = 1u;
+        if (s_bl_hold_ms < BL_SLEEP_HOLD_MS) s_bl_hold_ms++;
+        if (s_bl_hold_ms >= BL_SLEEP_HOLD_MS) s_bl_sleep_req = 1u;
     }
     else
     {
         s_bl_hold_ms = 0u;
-        s_bl_reset_req = 0u;
+        s_bl_sleep_req = 0u;
     }
 }
 
@@ -821,26 +1031,19 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     static uint8_t usb_reset_done = 0;
 
-    if (GPIO_Pin == B2_Pin)
+    if (GPIO_Pin == B1_Pin)
     {
-        if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET)
+        if (s_stop2_armed)
         {
-            s_bl_pressed = 1u;
-            s_bl_hold_ms = 0u;
-        }
-        else
-        {
-            s_bl_pressed = 0u;
-            s_bl_hold_ms = 0u;
-            s_bl_reset_req = 0u;
+            /* Short BT1 press should start lamp after STOP2 wake. */
+            s_stop2_woke_by_b1 = 1u;
         }
     }
 
     if (GPIO_Pin == USB_Pin)
     {
-        if (HAL_GPIO_ReadPin(USB_GPIO_Port, USB_Pin) == GPIO_PIN_SET)
+        if (USB_IsPresent() != 0u)
         {
-            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
             if (!usb_reset_done)
             {
                 usb_reset_done = 1;
@@ -850,8 +1053,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         }
         else
         {
-            HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
             usb_reset_done = 0;
+            USB_CLI_NotifyDetach();
+            /* USB disconnected: switch to battery/autorun mode. */
+            mp_request_usb_detach();
+            /* Ensure indicator LED is not left stuck in "charger mirror" state. */
+            IND_LED_Off();
         }
     }
 }
@@ -871,9 +1078,9 @@ static void JumpToBootloader(void)
     /* Visual indication - blink LED 2x before jumping */
     for (int i = 0; i < 2; i++)
     {
-        HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+        IND_LED_On();
         HAL_Delay(100);
-        HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+        IND_LED_Off();
         HAL_Delay(100);
     }
     
@@ -961,6 +1168,110 @@ static void CheckBootloaderEntry(void)
         }
         
         HAL_Delay(10); /* Check every 10ms for faster response */
+    }
+}
+
+static void rtc_wakeup_1s_enable(void)
+{
+    static uint8_t nvic_init = 0;
+    if (!nvic_init)
+    {
+        /* STM32U073: Wakeup/Alarm share RTC_TAMP_IRQn */
+        HAL_NVIC_SetPriority(RTC_TAMP_IRQn, 0, 0);
+        HAL_NVIC_EnableIRQ(RTC_TAMP_IRQn);
+        nvic_init = 1;
+    }
+
+    (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+    (void)HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 0, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0);
+}
+
+static void rtc_wakeup_disable(void)
+{
+    (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+}
+
+static float vbat_read_blocking(uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    uint32_t id0 = ANALOG_GetUpdateId();
+    ANALOG_RequestUpdate();
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        ANALOG_Task();
+        if (ANALOG_GetUpdateId() != id0)
+            break;
+        __WFI();
+    }
+    return ANALOG_GetBat();
+}
+
+#define LOWBAT_MAGIC 0xB007u
+#define LOWBAT_BKP_REG RTC_BKP_DR1
+
+static void EnterLowBatteryStandby(void)
+{
+    if (USB_IsPresent() != 0u)
+        return;
+
+    rtc_wakeup_1s_enable();
+
+    /* Minimize loads */
+    Power_MinimizeLoads();
+
+    /* Standby with RTC wakeup: lowest power, wake causes reset */
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);
+    HAL_SuspendTick();
+    HAL_PWR_EnterSTANDBYMode();
+}
+
+static void LowBattery_EarlyGate(void)
+{
+    if (USB_IsPresent() != 0u)
+    {
+        HAL_RTCEx_BKUPWrite(&hrtc, LOWBAT_BKP_REG, 0u);
+        rtc_wakeup_disable();
+        return;
+    }
+
+    uint32_t magic = HAL_RTCEx_BKUPRead(&hrtc, LOWBAT_BKP_REG);
+    float vbat = vbat_read_blocking(50);
+
+    if (magic == LOWBAT_MAGIC)
+    {
+        if (vbat < CHARGER_VBAT_RECOVERY)
+        {
+            EnterLowBatteryStandby();
+        }
+        HAL_RTCEx_BKUPWrite(&hrtc, LOWBAT_BKP_REG, 0u);
+        rtc_wakeup_disable();
+        return;
+    }
+
+    if (vbat < CHARGER_VBAT_CRITICAL)
+    {
+        HAL_RTCEx_BKUPWrite(&hrtc, LOWBAT_BKP_REG, LOWBAT_MAGIC);
+        EnterLowBatteryStandby();
+    }
+}
+
+static void LowBattery_Task(void)
+{
+    static uint32_t last_check_ms = 0;
+    if (USB_IsPresent() != 0u)
+        return;
+
+    uint32_t now = HAL_GetTick();
+    if ((now - last_check_ms) < 1000u)
+        return;
+    last_check_ms = now;
+
+    float vbat = vbat_read_blocking(50);
+    if (vbat < CHARGER_VBAT_CRITICAL)
+    {
+        HAL_RTCEx_BKUPWrite(&hrtc, LOWBAT_BKP_REG, LOWBAT_MAGIC);
+        EnterLowBatteryStandby();
     }
 }
 

@@ -8,15 +8,13 @@
 #include "charger.h"
 #include "main.h"
 #include "analog.h"
-#include "ux_api.h"
 
 /* State machine states */
 static uint8_t charge_enabled = 0;
 static uint32_t last_check_tick = 0;
-static uint8_t usb_disconnected = 0;
 
-/* Check battery voltage every 100ms */
-#define CHARGER_CHECK_INTERVAL_MS  100
+/* Check battery voltage periodically */
+#define CHARGER_CHECK_INTERVAL_MS  1000
 
 void CHARGER_Init(void)
 {
@@ -27,7 +25,6 @@ void CHARGER_Init(void)
     /* Start with charging disabled */
     HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_RESET);
     charge_enabled = 0;
-    usb_disconnected = 0;
     
     last_check_tick = HAL_GetTick();
 }
@@ -40,53 +37,37 @@ void CHARGER_Task(void)
     if ((now - last_check_tick) >= CHARGER_CHECK_INTERVAL_MS)
     {
         last_check_tick = now;
+
+        /* Wait until ANALOG has produced at least one valid measurement. */
+        if (ANALOG_GetUpdateId() == 0U)
+        {
+            return;
+        }
         
         float vbat = ANALOG_GetBat();
-        
-        /* Critical low voltage - disconnect USB to save power */
-        if (vbat < CHARGER_VBAT_CRITICAL && !usb_disconnected)
+
+        /* Voltage-based charge control with hysteresis (no USB stack control here). */
+        if (vbat > CHARGER_VBAT_STOP && charge_enabled)
         {
-            /* Disconnect USB stack immediately */
-            ux_device_stack_disconnect();
-            usb_disconnected = 1;
-            
-            /* Enable charging before entering low power mode */
+            /* Stop charging - voltage too high */
+            HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_RESET);
+            charge_enabled = 0;
+        }
+        else if (vbat < CHARGER_VBAT_START && !charge_enabled)
+        {
+            /* Start charging - voltage low enough */
             HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_SET);
             charge_enabled = 1;
         }
-        /* Voltage recovery - reset MCU if USB is connected */
-        else if (vbat > CHARGER_VBAT_RECOVERY && usb_disconnected)
-        {
-            /* Check if USB cable is physically connected (VBUS present) */
-            GPIO_PinState usb_vbus = HAL_GPIO_ReadPin(USB_GPIO_Port, USB_Pin);
-            
-            if (usb_vbus == GPIO_PIN_SET)
-            {
-                /* USB cable connected - reset MCU to reinitialize USB stack */
-                NVIC_SystemReset();
-            }
-        }
-        /* Normal voltage-based charge control with hysteresis */
-        else if (!usb_disconnected)
-        {
-            if (vbat > CHARGER_VBAT_STOP && charge_enabled)
-            {
-                /* Stop charging - voltage too high */
-                HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_RESET);
-                charge_enabled = 0;
-            }
-            else if (vbat < CHARGER_VBAT_START && !charge_enabled)
-            {
-                /* Start charging - voltage low enough */
-                HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_SET);
-                charge_enabled = 1;
-            }
-        }
     }
     
-    /* Update LED to mirror STA_CHG pin (charging status indicator) */
-    GPIO_PinState sta_chg = HAL_GPIO_ReadPin(STA_CHG_GPIO_Port, STA_CHG_Pin);
-    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, sta_chg);
+    /* Mirror charger status LED only when USB is connected; on battery this LED is used as a status LED. */
+    if (USB_IsPresent() != 0u)
+    {
+        GPIO_PinState sta_chg = HAL_GPIO_ReadPin(STA_CHG_GPIO_Port, STA_CHG_Pin);
+        /* STA_CHG is active-low: LED on when charging. */
+        IND_LED_Set((sta_chg == GPIO_PIN_RESET) ? 1u : 0u);
+    }
 }
 
 uint8_t CHARGER_IsCharging(void)

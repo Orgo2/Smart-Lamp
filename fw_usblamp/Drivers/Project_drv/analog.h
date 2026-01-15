@@ -39,6 +39,11 @@
 /* Number of ADC samples to average */
 #define ANALOG_NUM_SAMPLES      10
 
+/* Background auto-update period (ms); set to 0 to disable. */
+#ifndef ANALOG_AUTO_UPDATE_MS
+#define ANALOG_AUTO_UPDATE_MS   1000U
+#endif
+
 /* Public function prototypes */
 void ANALOG_Init(ADC_HandleTypeDef *hadc);
 void ANALOG_Task(void);
@@ -46,7 +51,7 @@ void ANALOG_RequestUpdate(void);
 uint8_t ANALOG_IsBusy(void);
 uint32_t ANALOG_GetUpdateId(void);
 
-/* Returns last computed values (non-blocking). */
+/* Returns last computed values (auto-refreshed in background). */
 float ANALOG_GetLight(void);
 float ANALOG_GetBat(void);
 float ANALOG_GetVcc(void);

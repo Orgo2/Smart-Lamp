@@ -50,6 +50,7 @@ static volatile uint8_t s_busy = 0U;
 static volatile uint8_t s_update_requested = 0U;
 static volatile uint32_t s_update_id = 0U;
 static volatile uint8_t s_conv_running = 0U;
+static volatile uint32_t s_last_update_tick = 0U;
 
 /* Private prototypes */
 static void ANALOG_ConfigChannel(uint32_t channel);
@@ -77,6 +78,8 @@ void ANALOG_Init(ADC_HandleTypeDef *hadc)
 
     (void)HAL_ADC_Stop(s_hadc);
     (void)HAL_ADCEx_Calibration_Start(s_hadc);
+
+    s_last_update_tick = 0U;
 
     /* Start first background update (non-blocking) */
     ANALOG_RequestUpdate();
@@ -169,13 +172,29 @@ uint8_t ANALOG_IsBusy(void)
 void ANALOG_Task(void)
 {
     /* Start a new non-blocking sequence if requested */
-    if ((s_hadc != NULL) && (s_busy == 0U) && (s_update_requested != 0U))
+    if ((s_hadc != NULL) && (s_busy == 0U))
     {
-        s_busy = 1U;
-        s_conv_running = 0U;
-        s_update_requested = 0U;
-        ANALOG_StartStep(ANALOG_STEP_VREFINT);
-        return;
+        uint32_t now = HAL_GetTick();
+        uint8_t do_start = 0U;
+
+        if (s_update_requested != 0U)
+        {
+            do_start = 1U;
+        }
+        else if (ANALOG_AUTO_UPDATE_MS != 0U)
+        {
+            if ((uint32_t)(now - s_last_update_tick) >= (uint32_t)ANALOG_AUTO_UPDATE_MS)
+                do_start = 1U;
+        }
+
+        if (do_start)
+        {
+            s_busy = 1U;
+            s_conv_running = 0U;
+            s_update_requested = 0U;
+            ANALOG_StartStep(ANALOG_STEP_VREFINT);
+            return;
+        }
     }
 
     /* Progress conversion state machine without blocking */
@@ -268,6 +287,7 @@ void ANALOG_Task(void)
                     s_light_lux = lux;
 
                     s_update_id++;
+                    s_last_update_tick = HAL_GetTick();
                 }
 
                 s_step = ANALOG_STEP_IDLE;

@@ -51,6 +51,10 @@ Core/Src/usb_cli.o: ../Core/Src/usb_cli.c ../Core/Inc/usb_cli.h \
  ../Middlewares/ST/usbx/common/core/inc/ux_system.h \
  ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_cdc_acm.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/led.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/rtc.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/analog.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h
 ../Core/Inc/usb_cli.h:
 ../Core/Inc/main.h:
@@ -107,4 +111,8 @@ Core/Src/usb_cli.o: ../Core/Src/usb_cli.c ../Core/Inc/usb_cli.h \
 ../Middlewares/ST/usbx/common/core/inc/ux_system.h:
 ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_cdc_acm.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/led.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/rtc.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/analog.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h:

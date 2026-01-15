@@ -2,16 +2,13 @@
 /*
   MiniPascal (tiny Pascal-like) interpreter for STM32 (HAL) with terminal UI over USB CDC (VCP).
 
-  v4 changes (per user request):
-  - Smaller default RAM footprint (program storage ~6KB configurable)
-  - 3 flash program slots: SAVE 1/2/3, LOAD 1/2/3, ERASE 1/2/3
-  - Flash slots are placed at END of flash (highest addresses) by default
-  - Abort running program if abort-button held 10s (no MCU reset)
-  - "Packet" lines like: LED 1 255 255 255 255 or TIME 12 30 0 or ALARM 7 15
-    -> parsed into system variables
-  - EDIT mode ends with the word END. (with '.' special char)
-  - SAVE <slot> START compiles + erases slot + saves + runs
-*/
+  Features (per project requests):
+  - 3 flash program slots inside linker FLASH_DATA region
+  - SAVE <slot> compiles + erases slot + saves
+  - LOAD <slot> loads + runs
+  - Abort running program if abort-button held MP_ABORT_HOLD_MS (no MCU reset)
+  - EDIT mode ends with the word QUIT
+ */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -72,9 +69,9 @@
 #define MP_FLASH_SLOT_COUNT (3u)
 #endif
 
-/* Abort button hold time (ms). You requested 10 seconds. */
+/* Abort button hold time (ms). Keep below reset-hold time if both use same pin. */
 #ifndef MP_ABORT_HOLD_MS
-#define MP_ABORT_HOLD_MS    (10000u)
+#define MP_ABORT_HOLD_MS    (2000u)
 #endif
 
 /* ---------------- HAL glue you must provide ---------------- */
@@ -106,8 +103,14 @@ bool mp_exec_builtin_line(const char *line, int32_t *ret_out, bool *has_ret);
 void mp_init(void);
 /* Call often from main loop; handles terminal + runs program time-sliced. */
 void mp_poll(void);
-/* Async stop (also available as terminal command STOP). */
-void mp_request_stop(void);
+ /* Async stop (also available as terminal command STOP). */
+ void mp_request_stop(void);
+ /* Request program start from a slot (safe to call from IRQ). */
+ void mp_request_run_slot(uint8_t slot);
+ /* Request (re)start of the currently loaded program (safe to call from IRQ). */
+ void mp_request_run_loaded(void);
+ /* Notify interpreter that USB was detached (safe to call from IRQ). */
+ void mp_request_usb_detach(void);
 void mp_start_session(void);
 void mp_stop_session(void);
 void mp_feed_char(char c);
@@ -115,3 +118,6 @@ void mp_task(void);
 bool mp_is_active(void);
 bool mp_exit_pending(void);
 void mp_buttons_poll(void);
+void mp_autorun_poll(void);
+/* Returns first non-empty slot (1..3) or 0 if all empty. */
+uint8_t mp_first_program_slot(void);

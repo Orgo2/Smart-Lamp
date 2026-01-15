@@ -16,4 +16,4 @@
 ../Core/Src/stm32u0xx_hal_msp.c:609:6:HAL_TIM_MspPostInit	2
 ../Core/Src/stm32u0xx_hal_msp.c:641:6:HAL_TIM_Base_MspDeInit	2
 ../Core/Src/stm32u0xx_hal_msp.c:669:6:HAL_PCD_MspInit	3
-../Core/Src/stm32u0xx_hal_msp.c:708:6:HAL_PCD_MspDeInit	2
+../Core/Src/stm32u0xx_hal_msp.c:719:6:HAL_PCD_MspDeInit	2

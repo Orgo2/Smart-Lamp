@@ -38,6 +38,8 @@ typedef enum
     /* Kvalita dát / zapojenie */
     MIC_ERR_DATA_STUCK = -7,       /* všetky vzorky vyzerajú rovnaké (DATA stuck na 0/1) */
     MIC_ERR_SIGNAL_SATURATED = -8, /* vyzerá to ako saturácia (RMS alebo peak ~ 1.0) */
+    /* State: capture running but no data yet */
+    MIC_ERR_NO_DATA_YET = -9,
 } mic_err_t;
 
 /* Zavolaj raz po MX_SPI1_Init() (napr. v main USER CODE BEGIN 2). */
@@ -78,6 +80,14 @@ void MIC_SetDebug(uint8_t enable);
 #define MIC_POWERSAVE   100u
 #endif
 
+/*
+ * CMM-4030DT-26154: ~52 ms wake-up po spustení clocku.
+ * Počas tejto doby môžu byť dáta stuck/nezmyselné, preto ich driver ignoruje.
+ */
+#ifndef MIC_WAKEUP_MS
+#define MIC_WAKEUP_MS   52u
+#endif
+
 /* ================= Legacy API (ponechané kvôli existujúcemu CLI) ================ */
 
 /* Jednorazové meranie a výpis debug informácií na UART (printf). */
@@ -91,6 +101,9 @@ float MIC_LastDbFS(void);
 
 /* Posledná vypočítaná "energia" (RMS) z dekódovaného PCM (0..1). */
 float MIC_LastRms(void);
+
+/* Debug: last error message (or NULL). */
+const char* MIC_LastErrorMsg(void);
 
 /* Debug: get last DMA buffer for CLI inspection */
 const uint16_t* MIC_DebugLastDmaBuf(uint32_t *out_words);

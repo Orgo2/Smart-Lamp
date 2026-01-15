@@ -60,6 +60,8 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+uint8_t USB_IsPresent(void);
+void Lamp_RequestOff(uint8_t enter_stop2);
 
 /* USER CODE END EFP */
 
@@ -90,6 +92,21 @@ void Error_Handler(void);
 #define BL_GPIO_Port GPIOF
 
 /* USER CODE BEGIN Private defines */
+
+/*
+ * Indicator LED polarity.
+ * Indicator LED is active-high (logic 1 = ON).
+ */
+#ifndef IND_LED_ON_LEVEL
+#define IND_LED_ON_LEVEL  GPIO_PIN_SET
+#endif
+#ifndef IND_LED_OFF_LEVEL
+#define IND_LED_OFF_LEVEL GPIO_PIN_RESET
+#endif
+
+static inline void IND_LED_On(void)  { HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, IND_LED_ON_LEVEL); }
+static inline void IND_LED_Off(void) { HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, IND_LED_OFF_LEVEL); }
+static inline void IND_LED_Set(uint8_t on) { if (on) IND_LED_On(); else IND_LED_Off(); }
 
 /* USER CODE END Private defines */
 
