@@ -1,10 +1,5 @@
 /*
- * charger.h - Battery charger management for STNS01
- *
- *  Created on: Jan 2, 2026
- *      Author: orgo
- * 
- *  Controls STNS01 battery charger with voltage monitoring and sleep mode
+ * charger.h - STNS01 charger control and status helpers.
  */
 
 #ifndef PROJECT_DRV_CHARGER_H_
@@ -19,35 +14,19 @@
 #define CHARGER_VBAT_CRITICAL   2.9f    /* Criticaly low, use the lowest rtc standby */
 #define CHARGER_VBAT_RECOVERY   3.1f    /* Recovery threshold - reset MCU if USB connected */
 
-/**
- * @brief Initialize charger driver
- * @note Call once during system init, after GPIO and ADC init
- */
+/* Initialize charger driver (call once during init, after GPIO and ADC init). */
 void CHARGER_Init(void);
 
-/**
- * @brief Charger task - call periodically from main loop
- * @note Monitors battery voltage and controls charging
- *       Updates LED to mirror STA_CHG pin status
- */
+/* Charger task (call periodically). */
 void CHARGER_Task(void);
 
-/**
- * @brief Get charging status
- * @return 1 if charging enabled, 0 if disabled
- */
+/* Return 1 if charging enabled, 0 if disabled. */
 uint8_t CHARGER_IsCharging(void);
 
-/**
- * @brief Get STA_CHG pin status
- * @return 1=charging, 2=not charging, 3=error (toggling/fault)
- */
+/* Read STA_CHG status: 1=charging, 2=not charging, 3=error/fault. */
 uint8_t CHARGER_GetStatus(void);
 
-/**
- * @brief Reset charger by toggling CTL_CEN pin
- * @note Use this to clear fault conditions (timeout, VPRE error, end-of-charge)
- */
+/* Reset charger by toggling CTL_CEN (clears typical fault conditions). */
 void CHARGER_Reset(void);
 
 #endif /* PROJECT_DRV_CHARGER_H_ */

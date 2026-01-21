@@ -60,6 +60,10 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mp_buttons.h \
+ ../Core/Inc/lp_delay.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/rtc.h \
+ ../Core/Inc/memmon.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pwr_ex.h
 ../Core/Inc/main.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal.h:
@@ -125,4 +129,8 @@ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/ala
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mp_buttons.h:
+../Core/Inc/lp_delay.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/rtc.h:
+../Core/Inc/memmon.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pwr_ex.h:

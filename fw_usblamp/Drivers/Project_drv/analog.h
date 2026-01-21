@@ -1,8 +1,5 @@
 /*
- * analog.h
- *
- *  Created on: Dec 13, 2025
- *      Author: orgo
+ * analog.h - Analog measurements (light sensor, battery, VCC).
  */
 
 #ifndef PROJECT_DRV_ANALOG_H_
@@ -11,12 +8,12 @@
 #include "stm32u0xx_hal.h"
 
 /* Configuration constants */
-#define ANALOG_VREF             3.3f        // Reference voltage in volts (nominal)
-#define ANALOG_ADC_MAX_VALUE    4095.0f     // 12-bit without oversampling (OversamplingMode = DISABLE)
+#define ANALOG_VREF             3.3f        /* Reference voltage (nominal). */
+#define ANALOG_ADC_MAX_VALUE    4095.0f     /* 12-bit without oversampling. */
 
 /* Light sensor (TIA with SFH203P photodiode) configuration */
-#define ANALOG_TIA_RESISTOR     330000.0f   // 330k ohm TIA feedback resistor
-#define ANALOG_LIGHT_CHANNEL    ADC_CHANNEL_14  // PA7 - AN_LI
+#define ANALOG_TIA_RESISTOR     330000.0f       /* 330k ohm TIA feedback resistor. */
+#define ANALOG_LIGHT_CHANNEL    ADC_CHANNEL_14  /* PA7 - AN_LI */
 
 /*
  * Photodiode current-to-lux conversion.
@@ -31,10 +28,10 @@
 #endif
 
 /* Battery voltage divider configuration */
-#define ANALOG_BAT_R1           100000.0f   // 100k ohm (top resistor)
-#define ANALOG_BAT_R2           47000.0f    // 47k ohm (bottom resistor)
+#define ANALOG_BAT_R1           100000.0f       /* 100k ohm (top resistor). */
+#define ANALOG_BAT_R2           47000.0f        /* 47k ohm (bottom resistor). */
 #define ANALOG_BAT_DIVIDER      ((ANALOG_BAT_R2) / (ANALOG_BAT_R1 + ANALOG_BAT_R2))
-#define ANALOG_BAT_CHANNEL      ADC_CHANNEL_17  // PB0 - AN_BAT (ADC1_IN17 on QFN32)
+#define ANALOG_BAT_CHANNEL      ADC_CHANNEL_17  /* PB0 - AN_BAT (ADC1_IN17 on QFN32). */
 
 /* Number of ADC samples to average */
 #define ANALOG_NUM_SAMPLES      10

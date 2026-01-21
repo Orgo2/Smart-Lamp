@@ -1,15 +1,16 @@
 /*
- * bme280.c
+ * bme280.c - BME280 sensor driver (I2C).
  */
 
 #include "bme280.h"
 #include "main.h"
+#include "lp_delay.h"
 #include <string.h>
 
-// External I2C handle (defined in main.c)
+/* External I2C handle (defined in main.c). */
 extern I2C_HandleTypeDef hi2c1;
 
-// BME280 Registers
+/* BME280 registers. */
 #define BME280_REG_ID           0xD0
 #define BME280_REG_RESET        0xE0
 #define BME280_REG_CTRL_HUM     0xF2
@@ -28,7 +29,7 @@ extern I2C_HandleTypeDef hi2c1;
 #define BME280_STANDBY_0_5_MS   0x00
 
 #define BME280_TIMEOUT_MS       5000
-#define BME280_I2C_TIMEOUT_MS   500   // I2C operation timeout
+#define BME280_I2C_TIMEOUT_MS   500   /* I2C operation timeout. */
 
 typedef struct {
     uint16_t dig_T1;
@@ -87,14 +88,14 @@ HAL_StatusTypeDef BME280_Init(I2C_HandleTypeDef *hi2c)
     }
     
     BME280_WriteReg(BME280_REG_RESET, BME280_SOFT_RESET);
-    HAL_Delay(10);
+    LP_DELAY(10);
     
     if (BME280_ReadCalibrationData() != HAL_OK) {
         bme280_i2c = NULL;
         return HAL_ERROR;
     }
     
-    // Max accuracy: oversampling x16, filter x16
+    /* Max accuracy: oversampling x16, filter x16. */
     BME280_WriteReg(BME280_REG_CTRL_HUM, BME280_OVERSAMPLING_16X);
     
     uint8_t config = (BME280_STANDBY_0_5_MS << 5) | (BME280_FILTER_16 << 2);
@@ -105,7 +106,7 @@ HAL_StatusTypeDef BME280_Init(I2C_HandleTypeDef *hi2c)
                         BME280_NORMAL_MODE;
     BME280_WriteReg(BME280_REG_CTRL_MEAS, ctrl_meas);
     
-    HAL_Delay(100);
+    LP_DELAY(100);
     
     return HAL_OK;
 }
@@ -130,7 +131,7 @@ HAL_StatusTypeDef RH(float *humidity)
     if (BME280_Init(&hi2c1) != HAL_OK) {
         return HAL_ERROR;
     }
-    HAL_Delay(100); // Stabilizácia senzora
+    LP_DELAY(100); /* Sensor settle time. */
     
     BME280_Data_t data;
     HAL_StatusTypeDef status = BME280_ReadSensorData(&data);
@@ -147,7 +148,7 @@ HAL_StatusTypeDef T(float *temperature)
     if (BME280_Init(&hi2c1) != HAL_OK) {
         return HAL_ERROR;
     }
-    HAL_Delay(100); // Stabilizácia senzora
+    LP_DELAY(100); /* Sensor settle time. */
     
     BME280_Data_t data;
     HAL_StatusTypeDef status = BME280_ReadSensorData(&data);
@@ -164,7 +165,7 @@ HAL_StatusTypeDef P(float *pressure)
     if (BME280_Init(&hi2c1) != HAL_OK) {
         return HAL_ERROR;
     }
-    HAL_Delay(100); // Stabilizácia senzora
+    LP_DELAY(100); /* Sensor settle time. */
     
     BME280_Data_t data;
     HAL_StatusTypeDef status = BME280_ReadSensorData(&data);
@@ -181,7 +182,7 @@ HAL_StatusTypeDef BME280(BME280_Data_t *data)
     if (BME280_Init(&hi2c1) != HAL_OK) {
         return HAL_ERROR;
     }
-    HAL_Delay(100); // Stabilizácia senzora
+    LP_DELAY(100); /* Sensor settle time. */
     
     HAL_StatusTypeDef status = BME280_ReadSensorData(data);
     BME280_Deinit();
@@ -240,7 +241,7 @@ static HAL_StatusTypeDef BME280_ReadSensorData(BME280_Data_t *data)
     uint32_t hum = BME280_CompensateH(adc_H);
     data->humidity = hum / 1024.0f;
     
-    init_time = HAL_GetTick();  // Reset timeout on successful read
+    init_time = HAL_GetTick();  /* Reset timeout on successful read. */
     
     return HAL_OK;
 }

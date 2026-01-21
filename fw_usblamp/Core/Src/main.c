@@ -23,6 +23,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
+#include <stddef.h>
+#include <string.h>
 #include "usb_cli.h"
 #include "led.h"
 #include "analog.h"
@@ -30,6 +32,10 @@
 #include "charger.h"
 #include "mic.h"
 #include "MiniPascal.h"
+#include "mp_buttons.h"
+#include "lp_delay.h"
+#include "rtc.h"
+#include "memmon.h"
 #include "stm32u0xx_hal_pwr_ex.h"
 /* USER CODE END Includes */
 
@@ -40,13 +46,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-//////////////////flash memory reserved for user software data storage//////////////////////
+/* Flash memory reserved for user program/data storage. */
 extern const uint32_t __flash_data_start__;
 extern const uint32_t __flash_data_end__;
 
 #define FLASH_DATA_START ((uint32_t)&__flash_data_start__)
 #define FLASH_DATA_END   ((uint32_t)&__flash_data_end__)
 #define FLASH_DATA_SIZE  (FLASH_DATA_END - FLASH_DATA_START)
+
+/* RAM info (from linker script). */
+extern uint8_t _estack;
+#define RAM_START_ADDR 0x20000000u
 
 /* USER CODE END PD */
 
@@ -97,6 +107,7 @@ void HAL_SYSTICK_Callback(void);
 static void LowBattery_Task(void);
 static void LowBattery_EarlyGate(void);
 static void NoProgram_SleepUntilUSB(void);
+static void EnterStop(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -108,6 +119,12 @@ static volatile uint8_t s_usb_chgrst_done = 0u;
 /* STOP2 wake bookkeeping (so a short BT1 press reliably starts the lamp after wake). */
 static volatile uint8_t s_stop2_armed = 0u;
 static volatile uint8_t s_stop2_woke_by_b1 = 0u;
+
+/* Battery policy: after USB detach, do not autorun; wait in STOP2 for B1 hold. */
+static volatile uint8_t s_battery_run_allowed = 1u;
+
+/* First-stage GPIO init (bootloader entry check) should not enable EXTI NVIC. */
+static volatile uint8_t s_gpio_skip_exti_nvic = 0u;
 
 /* USER CODE END 0 */
 
@@ -135,9 +152,11 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  /* GPIO init for bootloader check (B2 held 2s). */
+  /* GPIO init for bootloader check (BL held 5s). */
+  s_gpio_skip_exti_nvic = 1u;
   MX_GPIO_Init();
   CheckBootloaderEntry();
+  s_gpio_skip_exti_nvic = 0u;
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -153,14 +172,14 @@ int main(void)
   MX_RNG_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  // LED power supply will be enabled via 'ledinit' command
+  /* Enable LED power supply. */
   HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_SET);
-  HAL_Delay(100);
+  LP_DELAY(100);
 
-  // Initialize ANALOG driver (ADC with VREFINT calibration)
+  /* Initialize ANALOG driver (ADC with VREFINT calibration). */
   ANALOG_Init(&hadc1);
 
-  // Initialize charger driver
+  /* Initialize charger driver. */
   CHARGER_Init();
   if (USB_IsPresent() != 0u)
   {
@@ -168,18 +187,24 @@ int main(void)
     s_usb_chgrst_done = 1u;
   }
 
-  // If battery is critically low (and no USB), park MCU in RTC-standby and retry every 1s
+  /* If battery is critically low (and no USB), park MCU in standby and retry every 1 s. */
   LowBattery_EarlyGate();
 
-  // Initialize PDM microphone driver (SPI1+DMA). After this, MIC_Task() will process 50ms windows.
+  /* Initialize PDM microphone driver (SPI1+DMA). MIC_Task() updates 50 ms windows. */
   MIC_Init();
-  // MIC_Start() is handled by the driver automatically if needed (powersave/continuous).
+  /* MIC_Start() is handled by the driver automatically if needed (interval/continuous). */
 
-  //inicialise usb interface comunication
+  /* Initialize USB CLI (CDC). */
   USB_CLI_Init();
   
-  // Initialize MiniPascal interpreter
+  /* Initialize MiniPascal interpreter. */
   mp_init();
+
+  /* Initialize button debouncer/event queue (battery use). */
+  MP_Buttons_Init();
+
+  /* Track RAM free/min-free for debugging (CLI MEM). */
+  MemMon_Init();
 
   /* If running on battery and no programs exist, blink and wait in low power until USB is connected. */
   if ((USB_IsPresent() == 0u) && (mp_first_program_slot() == 0u))
@@ -190,7 +215,7 @@ int main(void)
   {
     /* Battery boot OK: 1x blink 200ms */
     IND_LED_On();
-    HAL_Delay(200);
+    LP_DELAY(200);
     IND_LED_Off();
   }
 
@@ -220,6 +245,7 @@ int main(void)
         mp_request_usb_detach();
         IND_LED_Off();
         s_usb_chgrst_done = 0u;
+        s_battery_run_allowed = 0u;
       }
       s_usb_pin_prev = usb_pin;
 
@@ -227,6 +253,21 @@ int main(void)
       {
         ux_device_stack_tasks_run();
         USB_CLI_Task();
+      }
+
+      /* Debounced buttons: feed short/long events into MiniPascal (USB + battery). */
+      MP_Buttons_Poll(HAL_GetTick());
+      while (1)
+      {
+        mp_btn_id_t e = MP_Buttons_PopShort();
+        if (e == MP_BTN_NONE) break;
+        mp_notify_button_short((uint8_t)e);
+      }
+      while (1)
+      {
+        mp_btn_id_t e = MP_Buttons_PopLong();
+        if (e == MP_BTN_NONE) break;
+        mp_notify_button_long((uint8_t)e);
       }
 
       /* USB mode is controlled by USB detect pin. */
@@ -237,9 +278,13 @@ int main(void)
         {
           NoProgram_SleepUntilUSB();
         }
+        if (!s_battery_run_allowed)
+        {
+          EnterStop(); /* waits for B1 hold >=2s */
+          continue;
+        }
         mp_autorun_poll();
         mp_task();
-        mp_buttons_poll();
       }
       ANALOG_Task();
       CHARGER_Task();
@@ -247,7 +292,8 @@ int main(void)
       BEEP_Task();
       MIC_Task();
       BL_Task();
-      // Power save: MCU sleeps, wakes on interrupt (USB, UART, EXTI, SysTick...)
+      MemMon_Task();
+      /* Power save: sleep until an interrupt (USB/UART/EXTI/SysTick...). */
       __WFI();
     /* USER CODE END WHILE */
 
@@ -684,7 +730,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -788,11 +834,11 @@ static void MX_USB_PCD_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USB_Init 2 */
-    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x00 , PCD_SNG_BUF, 0x20);//EP0 OUT
-    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x80 , PCD_SNG_BUF, 0x60);//EP0 IN
-    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x81 , PCD_SNG_BUF, 0xA0);//EP1 IN
-    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x82 , PCD_SNG_BUF, 0xE0);//EP2 IN
-    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x03 , PCD_SNG_BUF, 0xF0);//EP3 OUT
+    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x00 , PCD_SNG_BUF, 0x20); /* EP0 OUT */
+    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x80 , PCD_SNG_BUF, 0x60); /* EP0 IN */
+    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x81 , PCD_SNG_BUF, 0xA0); /* EP1 IN */
+    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x82 , PCD_SNG_BUF, 0xE0); /* EP2 IN */
+    HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS , 0x03 , PCD_SNG_BUF, 0xF0); /* EP3 OUT */
 
     /* NOTE: Do NOT start USB or init USBX DCD here.
      * It is done in MX_USBX_Device_Init() after USBX stack is ready.
@@ -887,10 +933,13 @@ static void MX_GPIO_Init(void)
   __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
   __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
   __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
-  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
-  HAL_NVIC_SetPriority(EXTI2_3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI2_3_IRQn);
+  if (!s_gpio_skip_exti_nvic)
+  {
+    HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
+    HAL_NVIC_SetPriority(EXTI2_3_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI2_3_IRQn);
+  }
 
   /* Default indicator LED to OFF. */
   IND_LED_Off();
@@ -901,6 +950,239 @@ static void MX_GPIO_Init(void)
 uint8_t USB_IsPresent(void)
 {
   return (HAL_GPIO_ReadPin(USB_GPIO_Port, USB_Pin) == GPIO_PIN_SET) ? 1u : 0u;
+}
+
+/* MiniPascal HAL glue (board integration). */
+int mp_hal_getchar(void)
+{
+  return -1;
+}
+
+void mp_hal_putchar(char c)
+{
+  char b[2] = {c, 0};
+  cdc_write_str(b);
+}
+
+uint32_t mp_hal_millis(void)
+{
+  return HAL_GetTick();
+}
+
+int mp_hal_abort_pressed(void)
+{
+  return (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET) ? 1 : 0;
+}
+
+int mp_hal_usb_connected(void)
+{
+  return (USB_IsPresent() != 0u) ? 1 : 0;
+}
+
+void mp_hal_led_power_on(void)
+{
+  if (HAL_GPIO_ReadPin(CTL_LEN_GPIO_Port, CTL_LEN_Pin) == GPIO_PIN_RESET)
+  {
+    HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_SET);
+    LP_DELAY(100);
+  }
+}
+
+void mp_hal_led_power_off(void)
+{
+  HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_RESET);
+}
+
+static volatile uint8_t s_mp_wut_fired = 0u;
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc_ptr)
+{
+  (void)hrtc_ptr;
+  s_mp_wut_fired = 1u;
+}
+
+static void lp_delay_sleep_ms(uint32_t ms)
+{
+  if (ms == 0u) return;
+  uint32_t start = HAL_GetTick();
+  while ((uint32_t)(HAL_GetTick() - start) < ms)
+    HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+}
+
+static uint8_t lp_delay_rtc_ready(void)
+{
+  return (hrtc.Instance == RTC) ? 1u : 0u;
+}
+
+void LP_DELAY(uint32_t ms)
+{
+  if (ms == 0u) return;
+
+  if (USB_IsPresent() != 0u)
+  {
+    HAL_Delay(ms);
+    return;
+  }
+
+  if ((ms < 20u) || (lp_delay_rtc_ready() == 0u))
+  {
+    lp_delay_sleep_ms(ms);
+    return;
+  }
+
+  /* RTC WUT @ RTCCLK/16 = 32768/16 = 2048 Hz (0.488 ms resolution), max ~32 s per shot. */
+  while (ms)
+  {
+    uint32_t chunk_ms = ms;
+    if (chunk_ms > 32000u) chunk_ms = 32000u;
+
+    uint32_t ticks = (chunk_ms * 2048u + 999u) / 1000u;
+    if (ticks < 1u) ticks = 1u;
+    if (ticks > 65536u) ticks = 65536u;
+
+    s_mp_wut_fired = 0u;
+    (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+
+    if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, (uint32_t)(ticks - 1u), RTC_WAKEUPCLOCK_RTCCLK_DIV16, 0u) != HAL_OK)
+    {
+      /* Fallback to light sleep if WUT setup fails. */
+      lp_delay_sleep_ms(chunk_ms);
+    }
+    else
+    {
+      while (!s_mp_wut_fired)
+      {
+        __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+        HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+        SystemClock_Config();
+      }
+      (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+    }
+
+    ms -= chunk_ms;
+  }
+}
+
+void mp_hal_lowpower_delay_ms(uint32_t ms)
+{
+  LP_DELAY(ms);
+}
+
+/* RAM usage monitor (CLI MEM). */
+extern void *_sbrk(ptrdiff_t incr);
+
+static volatile uint8_t  s_memmon_inited = 0u;
+static volatile uint32_t s_mem_heap_end = 0u;
+static volatile uint32_t s_mem_min_free = 0xFFFFFFFFu;
+static volatile uint32_t s_mem_min_tick_ms = 0u;
+static volatile uint8_t  s_mem_min_need_ts = 0u;
+static char s_mem_min_dt[RTC_DATETIME_STRING_SIZE] = "N/A";
+
+static uint32_t memmon_total_bytes(void)
+{
+  return (uint32_t)(&_estack) - RAM_START_ADDR;
+}
+
+static uint32_t memmon_free_bytes_with_heap_end(uint32_t heap_end)
+{
+  uint32_t msp = (uint32_t)__get_MSP();
+  if (msp <= heap_end) return 0u;
+  return msp - heap_end;
+}
+
+static void memmon_update_min(uint32_t free_now, uint32_t tick_ms)
+{
+  if (free_now < s_mem_min_free)
+  {
+    s_mem_min_free = free_now;
+    s_mem_min_tick_ms = tick_ms;
+    s_mem_min_need_ts = 1u;
+  }
+}
+
+void MemMon_Init(void)
+{
+  void *p = _sbrk(0);
+  if (p == (void *)-1) p = 0;
+  s_mem_heap_end = (uint32_t)p;
+
+  s_mem_min_free = 0xFFFFFFFFu;
+  s_mem_min_tick_ms = HAL_GetTick();
+  s_mem_min_need_ts = 1u;
+  (void)memset(s_mem_min_dt, 0, sizeof(s_mem_min_dt));
+  (void)strncpy(s_mem_min_dt, "N/A", sizeof(s_mem_min_dt) - 1u);
+
+  s_memmon_inited = 1u;
+  memmon_update_min(memmon_free_bytes_with_heap_end(s_mem_heap_end), HAL_GetTick());
+}
+
+void MemMon_Task(void)
+{
+  if (!s_memmon_inited) return;
+
+  void *p = _sbrk(0);
+  if (p != (void *)-1)
+    s_mem_heap_end = (uint32_t)p;
+
+  memmon_update_min(memmon_free_bytes_with_heap_end(s_mem_heap_end), HAL_GetTick());
+
+  if (s_mem_min_need_ts)
+  {
+    char dt[RTC_DATETIME_STRING_SIZE];
+    if (RTC_ReadClock(dt) == HAL_OK)
+    {
+      (void)strncpy(s_mem_min_dt, dt, sizeof(s_mem_min_dt) - 1u);
+      s_mem_min_dt[sizeof(s_mem_min_dt) - 1u] = '\0';
+    }
+    else
+    {
+      (void)strncpy(s_mem_min_dt, "RTC_ERR", sizeof(s_mem_min_dt) - 1u);
+      s_mem_min_dt[sizeof(s_mem_min_dt) - 1u] = '\0';
+    }
+    s_mem_min_need_ts = 0u;
+  }
+}
+
+void MemMon_TickHook(void)
+{
+  if (!s_memmon_inited) return;
+  memmon_update_min(memmon_free_bytes_with_heap_end(s_mem_heap_end), HAL_GetTick());
+}
+
+void MemMon_Get(uint32_t *out_total, uint32_t *out_free, uint32_t *out_min_free,
+                uint32_t *out_min_tick_ms, char *min_dt, uint32_t min_dt_sz)
+{
+  if (out_total) *out_total = memmon_total_bytes();
+
+  uint32_t heap_end = s_mem_heap_end;
+  uint32_t free_now = 0u;
+  void *p = _sbrk(0);
+  if (p != (void *)-1)
+    heap_end = (uint32_t)p;
+  free_now = memmon_free_bytes_with_heap_end(heap_end);
+
+  if (out_free) *out_free = free_now;
+
+  uint32_t now = HAL_GetTick();
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  s_mem_heap_end = heap_end;
+  memmon_update_min(free_now, now);
+  uint32_t min_free = s_mem_min_free;
+  uint32_t min_tick = s_mem_min_tick_ms;
+  char dt_copy[RTC_DATETIME_STRING_SIZE];
+  (void)memset(dt_copy, 0, sizeof(dt_copy));
+  (void)strncpy(dt_copy, s_mem_min_dt, sizeof(dt_copy) - 1u);
+  __set_PRIMASK(primask);
+
+  if (out_min_free) *out_min_free = min_free;
+  if (out_min_tick_ms) *out_min_tick_ms = min_tick;
+
+  if (min_dt && (min_dt_sz != 0u))
+  {
+    (void)strncpy(min_dt, dt_copy, min_dt_sz - 1u);
+    min_dt[min_dt_sz - 1u] = '\0';
+  }
 }
 
 /* BL hold-to-stop (active high, sampled in SysTick). */
@@ -921,29 +1203,60 @@ static void Power_MinimizeLoads(void)
     IND_LED_Off();
 }
 
+/* Return 1 if B1 stays pressed for hold_ms after wake, else 0. */
+#define B1_WAKE_HOLD_MS   2000u
+#define B1_ACTIVE_STATE   GPIO_PIN_SET
+static uint8_t B1_WaitHeld(uint32_t hold_ms)
+{
+    if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) != B1_ACTIVE_STATE)
+        return 0u;
+
+    uint32_t start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start) < hold_ms)
+    {
+        if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) != B1_ACTIVE_STATE)
+            return 0u;
+        HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    }
+    return 1u;
+}
+
 static void EnterStop(void)
 {
-    Power_MinimizeLoads();
-
-    /* Arm STOP2 wake tracking and clear any stale EXTI flags (prevents immediate wake). */
-    s_stop2_armed = 1u;
-    s_stop2_woke_by_b1 = 0u;
-    __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
-    __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
-    __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
-
-    /* Clear wakeup flag and enter STOP2 mode (wake via EXTI). */
-    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
-    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
-
-    /* Reconfigure system clock after STOP2 wakeup. */
-    SystemClock_Config();
-
-    s_stop2_armed = 0u;
-    if (s_stop2_woke_by_b1)
+    while (1)
     {
+        Power_MinimizeLoads();
+
+        /* Arm STOP2 wake tracking and clear any stale EXTI flags (prevents immediate wake). */
+        s_stop2_armed = 1u;
         s_stop2_woke_by_b1 = 0u;
-        mp_request_run_loaded();
+        __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
+        __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
+        __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
+
+        /* Clear wakeup flag and enter STOP2 mode (wake via EXTI). */
+        __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+        HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+
+        /* Reconfigure system clock after STOP2 wakeup. */
+        SystemClock_Config();
+
+        s_stop2_armed = 0u;
+        if (s_stop2_woke_by_b1)
+        {
+            s_stop2_woke_by_b1 = 0u;
+            if (B1_WaitHeld(B1_WAKE_HOLD_MS))
+            {
+                s_battery_run_allowed = 1u;
+                mp_request_run_loaded();
+                return;
+            }
+            /* Short/false wake: go back to STOP2. */
+            continue;
+        }
+
+        /* Wake by something else: return to caller. (USB attach will reset anyway.) */
+        return;
     }
 }
 
@@ -977,9 +1290,9 @@ static void NoProgram_SleepUntilUSB(void)
     for (uint8_t i = 0; i < 3; i++)
     {
         IND_LED_On();
-        HAL_Delay(200);
+        LP_DELAY(200);
         IND_LED_Off();
-        HAL_Delay(200);
+        LP_DELAY(200);
     }
 
     /* Disable button EXTI lines so only USB connect can wake us. */
@@ -1015,7 +1328,12 @@ static void BL_Task(void)
 
 void HAL_SYSTICK_Callback(void)
 {
-    if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) == BL_ACTIVE_STATE)
+    if (USB_IsPresent() != 0u)
+    {
+        s_bl_hold_ms = 0u;
+        s_bl_sleep_req = 0u;
+    }
+    else if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) == BL_ACTIVE_STATE)
     {
         if (s_bl_hold_ms < BL_SLEEP_HOLD_MS) s_bl_hold_ms++;
         if (s_bl_hold_ms >= BL_SLEEP_HOLD_MS) s_bl_sleep_req = 1u;
@@ -1025,6 +1343,8 @@ void HAL_SYSTICK_Callback(void)
         s_bl_hold_ms = 0u;
         s_bl_sleep_req = 0u;
     }
+
+    MemMon_TickHook();
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -1059,6 +1379,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
             mp_request_usb_detach();
             /* Ensure indicator LED is not left stuck in "charger mirror" state. */
             IND_LED_Off();
+            /* Do not autorun on detach: go to STOP2 and wait for B1 hold. */
+            s_battery_run_allowed = 0u;
+            Lamp_RequestOff(1u);
         }
     }
 }
@@ -1079,52 +1402,57 @@ static void JumpToBootloader(void)
     for (int i = 0; i < 2; i++)
     {
         IND_LED_On();
-        HAL_Delay(100);
+        LP_DELAY(100);
         IND_LED_Off();
-        HAL_Delay(100);
+        LP_DELAY(100);
     }
     
     /* 1. Disable all interrupts */
     __disable_irq();
-    
-    /* 2. Reset USB peripheral */
-    USB_DRD_FS->CNTR = 0x0003;
-    
-    /* 3. De-init LPTIM */
-    HAL_LPTIM_DeInit(&hlptim2);
-    
-    /* 4. Reset clock to default state (HSI) */
-    HAL_RCC_DeInit();
-    
-    /* 5. Disable Systick timer */
+
+    /* 2. Disable HAL tick (SysTick) */
     SysTick->CTRL = 0;
     SysTick->LOAD = 0;
     SysTick->VAL = 0;
     
-    /* 6. Clear all NVIC interrupt bits */
+    /* 3. Disable and clear all NVIC interrupt bits */
     for (uint8_t i = 0; i < sizeof(NVIC->ICER) / sizeof(NVIC->ICER[0]); i++)
     {
         NVIC->ICER[i] = 0xFFFFFFFF;
         NVIC->ICPR[i] = 0xFFFFFFFF;
     }
+
+    /* 4. Clear EXTI pending flags and mask EXTI lines (avoid spurious IRQs in ROM bootloader). */
+    __HAL_GPIO_EXTI_CLEAR_IT(B1_Pin);
+    __HAL_GPIO_EXTI_CLEAR_IT(B2_Pin);
+    __HAL_GPIO_EXTI_CLEAR_IT(USB_Pin);
+    EXTI->IMR1 = 0u;
+
+    /* 5. Reset clocks and HAL state back to defaults (HSI, no PLL, peripherals reset). */
+    (void)HAL_DeInit();
+    (void)HAL_RCC_DeInit();
     
-    /* 7. Enable SYSCFG clock for memory remap */
+    /* 6. Enable SYSCFG clock for memory remap */
     __HAL_RCC_SYSCFG_CLK_ENABLE();
     
-    /* 8. Remap system memory to 0x00000000 - MUST be before MSP/jump */
-    SYSCFG->CFGR1 = SYSCFG_CFGR1_MEM_MODE_0;
+    /* 7. Remap system memory to 0x00000000 - MUST be before MSP/jump */
+    __HAL_SYSCFG_REMAPMEMORY_SYSTEMFLASH();
     
-    /* 9. Read bootloader stack pointer and reset vector */
+    /* 8. Read bootloader stack pointer and reset vector */
     uint32_t bootloader_stack = *(__IO uint32_t *)(BOOT_ADD);
     uint32_t bootloader_reset = *(__IO uint32_t *)(BOOT_ADD + 4);
     
-    /* 10. Set the main stack pointer */
+    /* 9. Set the main stack pointer */
     __set_MSP(bootloader_stack);
-    
-    /* 11. Re-enable interrupts */
-    __enable_irq();
-    
-    /* 12. Jump to bootloader reset handler */
+
+#if defined(SCB) && defined(SCB_VTOR_TBLOFF_Msk)
+    /* On Cortex-M0+, also point VTOR to system memory for safety. */
+    SCB->VTOR = BOOT_ADD;
+#endif
+    __DSB();
+    __ISB();
+
+    /* 10. Jump to bootloader reset handler (keep IRQs disabled) */
     void (*jump_to_boot)(void) = (void (*)(void))(bootloader_reset);
     jump_to_boot();
     
@@ -1133,18 +1461,20 @@ static void JumpToBootloader(void)
 }
 
 /**
- * @brief Check if B2 button is pressed at startup and jump to bootloader
+ * @brief Check if BL button is pressed at startup and jump to bootloader
  * @note Must be called after MX_GPIO_Init()
+ *       BL is on PF3 (EXTI3), which is shared with USB detect on PA3 (EXTI3).
+ *       To avoid EXTI source conflicts, BL is sampled by polling only.
  *       - Button pressed: blocks here (no other peripherals init)
- *       - Released before 2s: continues normal boot
- *       - Held for 2s: jumps to bootloader
+ *       - Released before 5s: continues normal boot
+ *       - Held for 5s: jumps to DFU bootloader (system memory)
  */
 static void CheckBootloaderEntry(void)
 {
-    /* B2_Pin already initialized by MX_GPIO_Init() */
+    /* BL_Pin already initialized by MX_GPIO_Init() */
     
     /* If button not pressed, continue immediately */
-    if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) != GPIO_PIN_SET)
+    if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) != BL_ACTIVE_STATE)
     {
         return;
     }
@@ -1155,19 +1485,19 @@ static void CheckBootloaderEntry(void)
     while (1)
     {
         /* Button released - continue normal boot */
-        if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_RESET)
+        if (HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) != BL_ACTIVE_STATE)
         {
             return;  /* Exit and continue with peripheral initialization */
         }
         
-        /* Button held for 2 seconds - jump to bootloader */
-        if ((HAL_GetTick() - start_tick) >= 2000)
+        /* Button held for 5 seconds - jump to bootloader */
+        if ((HAL_GetTick() - start_tick) >= 5000u)
         {
             JumpToBootloader();
             /* Never returns */
         }
         
-        HAL_Delay(10); /* Check every 10ms for faster response */
+        LP_DELAY(10); /* Check every 10ms for faster response */
     }
 }
 

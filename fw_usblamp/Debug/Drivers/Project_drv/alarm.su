@@ -1,7 +1,6 @@
-../Drivers/Project_drv/alarm.c:34:13:alarm_stop	8	static
-../Drivers/Project_drv/alarm.c:41:13:alarm_stop_from_isr	8	static
-../Drivers/Project_drv/alarm.c:48:13:alarm_start_it	80	static
-../Drivers/Project_drv/alarm.c:124:6:HAL_LPTIM_AutoReloadMatchCallback	16	static
-../Drivers/Project_drv/alarm.c:142:6:BEEP	24	static,ignoring_inline_asm
-../Drivers/Project_drv/alarm.c:157:6:BEEP_Task	8	static
-../Drivers/Project_drv/alarm.c:166:6:BEEP_Test1kHz	48	static
+../Drivers/Project_drv/alarm.c:26:13:alarm_stop	8	static
+../Drivers/Project_drv/alarm.c:33:13:alarm_stop_from_isr	8	static
+../Drivers/Project_drv/alarm.c:40:13:alarm_start_it	80	static
+../Drivers/Project_drv/alarm.c:116:6:HAL_LPTIM_AutoReloadMatchCallback	16	static
+../Drivers/Project_drv/alarm.c:132:6:BEEP	24	static,ignoring_inline_asm
+../Drivers/Project_drv/alarm.c:147:6:BEEP_Task	8	static

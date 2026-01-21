@@ -45,7 +45,7 @@ Drivers/Project_drv/bme280.o: ../Drivers/Project_drv/bme280.c \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_ll_usb.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd_ex.h \
- ../Core/Inc/main.h
+ ../Core/Inc/main.h ../Core/Inc/lp_delay.h
 ../Drivers/Project_drv/bme280.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal.h:
 ../Core/Inc/stm32u0xx_hal_conf.h:
@@ -93,3 +93,4 @@ Drivers/Project_drv/bme280.o: ../Drivers/Project_drv/bme280.c \
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_ll_usb.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd_ex.h:
 ../Core/Inc/main.h:
+../Core/Inc/lp_delay.h:

@@ -13,6 +13,7 @@
 "./Drivers/Project_drv/charger.o"
 "./Drivers/Project_drv/led.o"
 "./Drivers/Project_drv/mic.o"
+"./Drivers/Project_drv/mp_buttons.o"
 "./Drivers/Project_drv/rtc.o"
 "./Drivers/STM32U0xx_HAL_Driver/Src/stm32u0xx_hal.o"
 "./Drivers/STM32U0xx_HAL_Driver/Src/stm32u0xx_hal_adc.o"

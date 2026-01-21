@@ -45,11 +45,10 @@ Drivers/Project_drv/MiniPascal.o: ../Drivers/Project_drv/MiniPascal.c \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_ll_usb.h \
  ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd_ex.h \
- ../Core/Inc/usb_cli.h ../Drivers/Project_drv/led.h \
- ../Drivers/Project_drv/bme280.h ../Drivers/Project_drv/analog.h \
- ../Drivers/Project_drv/charger.h ../Drivers/Project_drv/rtc.h \
- ../Drivers/Project_drv/mic.h ../Drivers/Project_drv/alarm.h \
- ../Core/Inc/main.h
+ ../Drivers/Project_drv/led.h ../Drivers/Project_drv/bme280.h \
+ ../Drivers/Project_drv/analog.h ../Drivers/Project_drv/charger.h \
+ ../Drivers/Project_drv/rtc.h ../Drivers/Project_drv/mic.h \
+ ../Drivers/Project_drv/alarm.h ../Core/Inc/main.h ../Core/Inc/lp_delay.h
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal.h:
 ../Core/Inc/stm32u0xx_hal_conf.h:
@@ -96,7 +95,6 @@ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/Min
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_ll_usb.h:
 ../Drivers/STM32U0xx_HAL_Driver/Inc/stm32u0xx_hal_pcd_ex.h:
-../Core/Inc/usb_cli.h:
 ../Drivers/Project_drv/led.h:
 ../Drivers/Project_drv/bme280.h:
 ../Drivers/Project_drv/analog.h:
@@ -105,3 +103,4 @@ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/Min
 ../Drivers/Project_drv/mic.h:
 ../Drivers/Project_drv/alarm.h:
 ../Core/Inc/main.h:
+../Core/Inc/lp_delay.h:

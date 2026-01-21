@@ -1,10 +1,15 @@
+/*
+ * MiniPascal.c - A tiny Pascal-like interpreter used by the USB CLI.
+ *
+ * Pipeline: text lines -> lexer (tokens) -> compiler (bytecode) -> VM (runs bytecode in small steps).
+ */
+
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <MiniPascal.h>
 
 #include "stm32u0xx_hal.h"
-#include "usb_cli.h"
 #include "led.h"
 #include "bme280.h"
 #include "analog.h"
@@ -13,13 +18,16 @@
 #include "mic.h"
 #include "alarm.h"
 #include "main.h"
+#include "lp_delay.h"
 
 /* External peripherals from main.c */
 extern RNG_HandleTypeDef hrng;
+extern RTC_HandleTypeDef hrtc;
+extern void SystemClock_Config(void);
 extern const uint32_t __flash_data_start__;
 extern const uint32_t __flash_data_end__;
 
-/* ============================ Minimal utils ============================ */
+/* Minimal helpers used by the interpreter (printing, formatting, small utilities). */
 static void mp_puts(const char *s){ while (*s) mp_hal_putchar(*s++); }
 static void mp_putcrlf(void){ mp_puts("\r\n"); }
 static void mp_prompt(void);  /* forward declaration */
@@ -29,8 +37,8 @@ static int builtin_id(const char *name);
 static void time_update_vars(int32_t *vars);
 static void time_print_ymdhm(void);
 static bool is_time0_call(const char *line);
-static bool mp_usb_connected(void);
 static int time_sel_id(const char *name);
+static bool g_session_active;
 
 static int mp_stricmp(const char *a, const char *b){
   while (*a && *b){
@@ -65,16 +73,11 @@ static void mp_put2(uint8_t v){
   mp_puts(b);
 }
 
-static void led_power_ensure_on(void){
-  if (HAL_GPIO_ReadPin(CTL_LEN_GPIO_Port, CTL_LEN_Pin) == GPIO_PIN_RESET){
-    HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_SET);
-    HAL_Delay(100);
-  }
-}
-
-static bool mp_usb_connected(void){
-  return (USB_IsPresent() != 0u);
-}
+/*
+ * Low-power delay (battery mode).
+ * Implementation is provided by the board layer (main.c) so MiniPascal stays hardware-agnostic.
+ */
+#define MP_DELAY_STOP2_THRESHOLD_MS 20u
 
 static void mp_utoa_hex(uint32_t v, char *out){
   static const char hex[] = "0123456789ABCDEF";
@@ -154,18 +157,16 @@ bool mp_exec_builtin_line(const char *line, int32_t *ret_out, bool *has_ret){
   if (id < 0) return false;
 
   bool ret = false;
-  if (id==3 || id==4 || id==5 || id==6 || id==7 || id==8 || id==9 || id==12 || id==16) ret = true;
-  if (id==11 && argc==0) ret = true;
+  if (id==3 || id==4 || id==5 || id==6 || id==7 || id==9 || id==12 || id==16) ret = true;
+  if (id==10 && argc==1) ret = true; /* time(sel) */
+  if (id==11 && argc==0) ret = true; /* alarm() */
   if (has_ret) *has_ret = ret;
 
   int32_t r = 0;
   if (id==2){
     if (argc!=1 || argv[0] < 0) return false;
     uint32_t ms = (uint32_t)argv[0];
-    uint32_t start = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - start) < ms){
-      HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-    }
+    LP_DELAY(ms);
     r = 0;
   } else {
     r = mp_user_builtin((uint8_t)id, argc, argv);
@@ -190,20 +191,10 @@ static uint16_t fnv1a16_ci(const char *s){
   return (uint16_t)((h ^ (h>>16)) & 0xFFFFu);
 }
 
-/* ============================ Weak abort button ============================ */
-#if defined(__GNUC__)
-#define MP_WEAK __attribute__((weak))
-#else
-#define MP_WEAK
-#endif
-
-/* B2 button abort: returns 1 if B2 pressed, 0 otherwise */
-MP_WEAK int mp_hal_abort_pressed(void){
-  /* B2 is active-high on this board. */
-  return (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET) ? 1 : 0;
-}
-
-/* ============================ Program storage (editor) ============================ */
+/*
+ * Program editor storage.
+ * Keeps the program as numbered lines (like classic BASIC) so you can edit/replace single lines.
+ */
 typedef struct {
   int line_no;
   char text[MP_LINE_LEN];
@@ -264,7 +255,10 @@ static void ed_list(const mp_editor_t *ed){
   }
 }
 
-/* ============================ System variables (fixed slots) ============================ */
+/*
+ * System variables (fixed slots in vm->vars[]).
+ * These names are visible to Pascal code and are updated by the runtime (time, last command args, etc).
+ */
 typedef struct { const char *name; uint8_t idx; } sysvar_t;
 
 enum {
@@ -295,7 +289,10 @@ static int sysvar_find(const char *name){
   return -1;
 }
 
-/* ============================ Lexer ============================ */
+/*
+ * Lexer: reads program text and produces tokens (numbers, identifiers, symbols).
+ * The compiler uses these tokens to understand the program structure.
+ */
 typedef enum {
   T_EOF=0, T_NUM, T_ID, T_STR,
   T_ASSIGN, /* := */
@@ -449,7 +446,10 @@ static void lex_next(lex_t *lx){
   lx->cur=t;
 }
 
-/* ============================ Compiler (to tiny bytecode) ============================ */
+/*
+ * Compiler: parses tokens and emits tiny bytecode instructions into program_t.
+ * Bytecode is a compact "instruction list" that the VM can execute quickly.
+ */
 typedef enum {
   OP_HALT=0,
   OP_PUSHI, OP_LOAD, OP_STORE,
@@ -533,34 +533,50 @@ static int sym_get_or_add(symtab_t *st, const char *name){
   return idx;
 }
 
-/* -------- Builtin name -> id table (EDIT HERE) --------
-   - led(i, v) for digital
-   - led(i, r, g, b, w) for RGBW (your use-case)
-*/
+/*
+ * Builtin name -> id table (compiler side).
+ * Pascal calls like `led(1,255)` are mapped to small numeric IDs used by the VM.
+ */
 static int builtin_id(const char *name){
+  /* LED control (Drivers/Project_drv/led.*). */
   if (!mp_stricmp(name,"led"))   return 1;
-  if (!mp_stricmp(name,"wait"))  return 2;
-  if (!mp_stricmp(name,"delay")) return 2;  /* alias for wait */
+  if (!mp_stricmp(name,"ledon")) return 13;
+  if (!mp_stricmp(name,"ledoff")) return 14;
+
+  /* Timing/power: delay is executed by the VM so programs sleep without blocking the CLI. */
+  if (!mp_stricmp(name,"delay")) return 2;
+
+  /* Analog measurements (Drivers/Project_drv/analog.*). */
   if (!mp_stricmp(name,"battery")) return 3;
+  if (!mp_stricmp(name,"light")) return 12;
+
+  /* RNG peripheral (main.c hrng). */
   if (!mp_stricmp(name,"rng"))   return 4;
+
+  /* BME280 sensor (Drivers/Project_drv/bme280.*). */
   if (!mp_stricmp(name,"temp"))  return 5;
   if (!mp_stricmp(name,"hum"))   return 6;
   if (!mp_stricmp(name,"press")) return 7;
-  if (!mp_stricmp(name,"btn"))   return 8;
-  if (!mp_stricmp(name,"btne"))  return 16;
+
+  /* Button events (short presses queued by mp_buttons_poll). */
+  if (!mp_stricmp(name,"btn"))   return 16;
+  if (!mp_stricmp(name,"btne"))  return 16; /* Backward compatible alias. */
+
+  /* Microphone processing (Drivers/Project_drv/mic.*). */
   if (!mp_stricmp(name,"mic"))   return 9;
-  if (!mp_stricmp(name,"time")) return 10; /* time() or time(yy,mo,dd,hh,mm) */
-  if (!mp_stricmp(name,"settime")) return 10; /* alias */
-  if (!mp_stricmp(name,"setalarm"))return 11; /* setalarm(h,m,s) */
-  if (!mp_stricmp(name,"alarm")) return 11; /* alias for setalarm */
-  if (!mp_stricmp(name,"light")) return 12;
-  if (!mp_stricmp(name,"ledon")) return 13;
-  if (!mp_stricmp(name,"ledoff")) return 14;
+
+  /* RTC clock/alarm (Drivers/Project_drv/rtc.*). */
+  if (!mp_stricmp(name,"time")) return 10;      /* time() or time(sel) */
+  if (!mp_stricmp(name,"settime")) return 17;   /* settime(yy,mo,dd,hh,mm) or settime(hh,mm,ss) */
+  if (!mp_stricmp(name,"alarm")) return 11;     /* alarm() -> active? */
+  if (!mp_stricmp(name,"setalarm"))return 18;   /* setalarm(hh,mm[,duration_sec]) daily */
+
+  /* Beeper (Drivers/Project_drv/alarm.*). */
   if (!mp_stricmp(name,"beep")) return 15;
   return -1;
 }
 
-/* -------- Recursive descent expression -------- */
+/* Expression parser: turns tokens into bytecode for arithmetic/logic and function calls. */
 typedef struct {
   lex_t lx;
   program_t *p;
@@ -632,7 +648,7 @@ static bool primary(Ctx *c){
       }
 
       if (id==2){
-        set_err("wait/delay only as statement", c->line); return false;
+        set_err("delay only as statement", c->line); return false;
       }
 
       if (!emit_u8(c->p, OP_CALL) || !emit_u8(c->p, (uint8_t)id) || !emit_u8(c->p, argc)){
@@ -716,7 +732,7 @@ static bool lor(Ctx *c){
 
 static bool expr(Ctx *c){ return lor(c); }
 
-/* -------- Statements -------- */
+/* Statement parser: turns IF/WHILE/BEGIN/END/REPEAT/GOTO into bytecode control flow. */
 static bool stmt(Ctx *c);
 
 static bool stmt_list_until(Ctx *c, tok_t until){
@@ -852,7 +868,7 @@ static bool st_assign_or_call(Ctx *c){
     }
   }
 
-  if (id==2 && argc!=1){ set_err("wait/delay expects 1 arg", c->line); return false; }
+  if (id==2 && argc!=1){ set_err("delay expects 1 arg", c->line); return false; }
 
   if(!emit_u8(c->p, OP_CALL) || !emit_u8(c->p, (uint8_t)id) || !emit_u8(c->p, argc)){ set_err("bytecode overflow", c->line); return false; }
 
@@ -945,7 +961,10 @@ static int editor_index_by_line(const mp_editor_t *ed, uint16_t line_no){
   return -1;
 }
 
-/* ============================ VM ============================ */
+/*
+ * VM (virtual machine): executes the compiled bytecode.
+ * It is stack-based and runs only a small number of ops per poll to keep UI responsive.
+ */
 typedef struct {
   int32_t stack[MP_STACK_SIZE];
   int sp;
@@ -1019,10 +1038,17 @@ static bool vm_step(vm_t *vm, const program_t *p, uint32_t now_ms, uint16_t max_
         for (int i=(int)argc-1;i>=0;i--){ if(!pop(vm,&argv[i])){ vm->running=false; break; } }
         if (!vm->running) break;
 
+        /* delay(ms) is handled in the VM so it can pause the program cooperatively. */
         if (id==2){
           if (argc!=1){ vm->running=false; break; }
           int32_t ms = argv[0];
           if (ms < 0) ms = 0;
+          if ((mp_hal_usb_connected() == 0) && !g_session_active && ((uint32_t)ms >= MP_DELAY_STOP2_THRESHOLD_MS))
+          {
+            LP_DELAY((uint32_t)ms);
+            if(!push(vm,0)) vm->running=false;
+            break;
+          }
           vm->sleeping=true;
           vm->wake_ms = now_ms + (uint32_t)ms;
           if(!push(vm,0)) vm->running=false;
@@ -1041,7 +1067,7 @@ static bool vm_step(vm_t *vm, const program_t *p, uint32_t now_ms, uint16_t max_
       } break;
       case OP_PRINTI: {
         if(!pop(vm,&a)) { vm->running=false; break; }
-        if (mp_usb_connected()){
+        if (mp_hal_usb_connected()){
           char b[16];
           mp_itoa(a, b);
           mp_puts(b);
@@ -1049,7 +1075,7 @@ static bool vm_step(vm_t *vm, const program_t *p, uint32_t now_ms, uint16_t max_
       } break;
       case OP_PRINTS: {
         uint8_t len = p->bc[vm->ip++];
-        if (mp_usb_connected()){
+        if (mp_hal_usb_connected()){
           for (uint8_t i=0;i<len;i++){
             mp_hal_putchar((char)p->bc[vm->ip++]);
           }
@@ -1058,7 +1084,7 @@ static bool vm_step(vm_t *vm, const program_t *p, uint32_t now_ms, uint16_t max_
         }
       } break;
       case OP_PRINTNL: {
-        if (mp_usb_connected()){
+        if (mp_hal_usb_connected()){
           mp_putcrlf();
         }
       } break;
@@ -1070,7 +1096,10 @@ static bool vm_step(vm_t *vm, const program_t *p, uint32_t now_ms, uint16_t max_
   return vm->running;
 }
 
-/* ============================ Flash storage: slots inside linker FLASH_DATA region ============================ */
+/*
+ * Flash program storage.
+ * Each slot stores the compiled program in the linker FLASH_DATA region (save/load/autorun).
+ */
 #define MP_MAGIC 0x4D505033u /* 'MPP3' */
 typedef struct __attribute__((packed)) {
   uint32_t magic;
@@ -1378,7 +1407,10 @@ uint8_t mp_first_program_slot(void){
   return g_first_program_slot;
 }
 
-/* ============================ Terminal CLI ============================ */
+/*
+ * Terminal CLI.
+ * Implements EDIT/SAVE/LOAD/RUN/STOP and prints help over USB CDC.
+ */
 static mp_editor_t g_ed;
 static program_t   g_prog;
 static vm_t        g_vm;
@@ -1389,32 +1421,37 @@ static bool        g_session_active=false;
 static bool        g_exit_pending=false;
 
 static bool g_edit=false;
-static int  g_next_line=10;
 static int  g_step=10;
 static volatile uint8_t g_run_slot_req = 0;
 static volatile uint8_t g_run_loaded_req = 0;
+static volatile uint8_t g_run_next_req = 0;
 static volatile uint8_t g_usb_detach_req = 0;
+static uint8_t g_edit_slot = 0;
+
+typedef struct {
+  uint8_t active;
+  uint8_t esc_state;
+  uint8_t esc_param;
+  uint8_t line_idx;
+  uint8_t added_tail;
+  char buf[MP_LINE_LEN];
+  uint8_t len;
+  uint8_t cur;
+  uint8_t preferred_col;
+} mp_edit_t;
+static mp_edit_t g_edit_state;
 
 static void mp_prompt(void){
-  if (g_edit){
-    /* In EDIT mode, show line number with > prefix for alignment */
-    char b[16];
-    mp_itoa(g_next_line, b);
-    mp_puts("> ");
-    mp_puts(b);
-    mp_puts(" ");
-  } else {
-    /* Normal mode, show > prompt */
-    mp_puts("> ");
-  }
+  if (g_edit) return;
+  mp_puts("> ");
 }
 
 static void help(void){
   mp_puts("MiniPascal monitor\r\n");
   mp_puts("\r\n");
   mp_puts("=== COMMANDS ===\r\n");
-  mp_puts("  EDIT         enter edit mode (new program)\r\n");
-  mp_puts("  QUIT         exit edit mode\r\n");
+  mp_puts("  EDIT         edit new program\r\n");
+  mp_puts("  EDIT 1       edit program from slot 1 (1-3)\r\n");
   mp_puts("  NEW          clear program\r\n");
   mp_puts("  LIST         show program\r\n");
   mp_puts("  RUN          compile and run\r\n");
@@ -1422,8 +1459,8 @@ static void help(void){
   mp_puts("  EXIT         exit Pascal mode\r\n");
   mp_puts("\r\n");
   mp_puts("=== EDIT MODE ===\r\n");
-  mp_puts("  Type statements without line numbers.\r\n");
-  mp_puts("  (Line numbers are optional and will be stripped.)\r\n");
+  mp_puts("  Arrow keys move, DEL/BKSP delete, ENTER splits line.\r\n");
+  mp_puts("  Ctrl+Q exits edit mode (or type QUIT on its own line).\r\n");
   mp_puts("\r\n");
   mp_puts("=== FLASH STORAGE ===\r\n");
   mp_puts("  SAVE 1       save to slot 1 (1-3)\r\n");
@@ -1433,19 +1470,16 @@ static void help(void){
   mp_puts("  LED(idx,r,g,b,w)    set LED color (idx 1-12)\r\n");
   mp_puts("  LEDON(r,g,b,w)      set all LEDs on\r\n");
   mp_puts("  LEDOFF()            turn all LEDs off\r\n");
-  mp_puts("  WAIT(ms)            delay milliseconds\r\n");
-  mp_puts("  DELAY(ms)           same as WAIT\r\n");
+  mp_puts("  DELAY(ms)           delay milliseconds (battery: >=20ms uses low power mode)\r\n");
   mp_puts("  BEEP(freq,vol,ms)   beep tone (vol 0-50)\r\n");
   mp_puts("  GOTO n              jump to line n\r\n");
-  mp_puts("  TIME()              update TIMEY/TIMEMO/TIMED/TIMEH/TIMEM (and TIMES)\r\n");
-  mp_puts("  TIME() in CLI prints: YY,MO,DD,HH,MM\r\n");
-  mp_puts("  TIME(yy,mo,dd,hh,mm) set RTC date/time\r\n");
-  mp_puts("  TIME(YY|MO|DD|HH|MM|SS) return part (MO=month, MM=minute)\r\n");
-  mp_puts("  SETTIME(...)        alias for TIME\r\n");
-  mp_puts("  WRITELN(...)        print text/numbers + newline\r\n");
-  mp_puts("  (WRITELN prints only when USB is connected)\r\n");
-  mp_puts("  ALARM(h,m,s)        set alarm\r\n");
-  mp_puts("  ALARM()             read alarm state (0/1)\r\n");
+  mp_puts("  TIME()              read RTC into TIMEY/TIMEMO/TIMED/TIMEH/TIMEM/TIMES\r\n");
+  mp_puts("  TIME(sel)           return part: 0=YY 1=MO 2=DD 3=HH 4=MM 5=SS (also: TIME(yy|mo|dd|hh|mm|ss))\r\n");
+  mp_puts("  SETTIME(yy,mo,dd,hh,mm) set RTC date+time (sec=0) yy=0..99 mo=1..12 dd=1..31 hh=0..23 mm=0..59\r\n");
+  mp_puts("  SETTIME(hh,mm,ss)   set RTC time only (keeps date) hh=0..23 mm=0..59 ss=0..59\r\n");
+  mp_puts("  WRITELN(...)        print text/numbers + newline (only when USB connected)\r\n");
+  mp_puts("  SETALARM(hh,mm[,dur]) set daily alarm at HH:MM (dur seconds, dur=0 disables, default dur=30)\r\n");
+  mp_puts("  ALARM()             alarm active flag (1 while alarm is running, else 0)\r\n");
   mp_puts("\r\n");
   mp_puts("=== READ FUNCTIONS (return value) ===\r\n");
   mp_puts("  BATTERY()    battery mV\r\n");
@@ -1454,8 +1488,7 @@ static void help(void){
   mp_puts("  TEMP()       temperature (x100)\r\n");
   mp_puts("  HUM()        humidity (x100)\r\n");
   mp_puts("  PRESS()      pressure (x100)\r\n");
-  mp_puts("  BTN()        button state\r\n");
-  mp_puts("  BTNE()       next short-press (0 none,1=B1,2=B2,3=BL)\r\n");
+  mp_puts("  BTN()        next short-press event (0=none, 1=B1, 2=B2, 3=BL)\r\n");
   mp_puts("  MIC()        microphone level\r\n");
   mp_puts("\r\n");
   mp_puts("=== FLOW CONTROL ===\r\n");
@@ -1490,7 +1523,433 @@ static void help(void){
   mp_puts("  x := time(MM)  minutes\r\n");
   mp_puts("  WRITELN('x=', x)\r\n");
   mp_puts("\r\n");
-  mp_puts("Tip: hold BL to enter stop, wake with B2\r\n");
+  mp_puts("Tip: hold BL to enter stop, wake with B1\r\n");
+}
+
+static void edit_load_from_ed(uint8_t idx)
+{
+  if (idx >= g_ed.count)
+  {
+    g_edit_state.len = 0;
+    g_edit_state.cur = 0;
+    g_edit_state.buf[0] = 0;
+    return;
+  }
+
+  strncpy(g_edit_state.buf, g_ed.lines[idx].text, MP_LINE_LEN);
+  g_edit_state.buf[MP_LINE_LEN - 1] = 0;
+  g_edit_state.len = (uint8_t)strnlen(g_edit_state.buf, MP_LINE_LEN - 1);
+  if (g_edit_state.cur > g_edit_state.len) g_edit_state.cur = g_edit_state.len;
+}
+
+static void edit_store_to_ed(uint8_t idx)
+{
+  if (idx >= g_ed.count) return;
+  strncpy(g_ed.lines[idx].text, g_edit_state.buf, MP_LINE_LEN);
+  g_ed.lines[idx].text[MP_LINE_LEN - 1] = 0;
+}
+
+static void edit_delete_line_at(uint8_t idx)
+{
+  if (idx >= g_ed.count) return;
+  for (uint8_t i = idx; i + 1u < g_ed.count; i++)
+    g_ed.lines[i] = g_ed.lines[i + 1u];
+  g_ed.count--;
+}
+
+static int map_line_no(int old_no, const int *old, const int *new_no, uint8_t count)
+{
+  for (uint8_t i = 0; i < count; i++)
+    if (old[i] == old_no) return new_no[i];
+  return old_no;
+}
+
+static void renumber_update_goto_line(char *dst, size_t dstsz, const char *src,
+                                      const int *old, const int *new_no, uint8_t count)
+{
+  if (!dst || dstsz == 0) return;
+  dst[0] = 0;
+  if (!src) return;
+
+  char quote = 0;
+  size_t di = 0;
+  for (size_t si = 0; src[si] && di + 1 < dstsz; )
+  {
+    char c = src[si];
+    if (quote)
+    {
+      dst[di++] = c;
+      si++;
+      if (c == quote) quote = 0;
+      continue;
+    }
+
+    if (c == '\'' || c == '"')
+    {
+      quote = c;
+      dst[di++] = c;
+      si++;
+      continue;
+    }
+
+    /* Replace "goto <number>" targets after renumbering. */
+    if ((si == 0 || !is_idn(src[si - 1])) &&
+        src[si + 0] && src[si + 1] && src[si + 2] && src[si + 3] &&
+        (tolower((unsigned char)src[si + 0]) == 'g') &&
+        (tolower((unsigned char)src[si + 1]) == 'o') &&
+        (tolower((unsigned char)src[si + 2]) == 't') &&
+        (tolower((unsigned char)src[si + 3]) == 'o') &&
+        (!is_idn(src[si + 4])))
+    {
+      dst[di++] = src[si++]; /* g */
+      if (di + 1 < dstsz) dst[di++] = src[si++]; /* o */
+      if (di + 1 < dstsz) dst[di++] = src[si++]; /* t */
+      if (di + 1 < dstsz) dst[di++] = src[si++]; /* o */
+
+      while ((src[si] == ' ' || src[si] == '\t') && di + 1 < dstsz)
+        dst[di++] = src[si++];
+
+      int v = 0;
+      size_t si0 = si;
+      while (src[si] >= '0' && src[si] <= '9')
+      {
+        v = v * 10 + (src[si] - '0');
+        si++;
+      }
+
+      if (si != si0)
+      {
+        int mapped = map_line_no(v, old, new_no, count);
+        char nb[16];
+        mp_itoa(mapped, nb);
+        for (size_t k = 0; nb[k] && di + 1 < dstsz; k++)
+          dst[di++] = nb[k];
+        continue;
+      }
+    }
+
+    dst[di++] = c;
+    si++;
+  }
+
+  dst[di] = 0;
+}
+
+static void edit_renumber_program(void)
+{
+  if (g_ed.count == 0) return;
+
+  int old_no[MP_MAX_LINES];
+  int new_no[MP_MAX_LINES];
+  uint8_t count = g_ed.count;
+  for (uint8_t i = 0; i < count; i++)
+  {
+    old_no[i] = g_ed.lines[i].line_no;
+    new_no[i] = 10 + ((int)i * g_step);
+  }
+
+  for (uint8_t i = 0; i < count; i++)
+  {
+    char tmp[MP_LINE_LEN];
+    renumber_update_goto_line(tmp, sizeof(tmp), g_ed.lines[i].text, old_no, new_no, count);
+    g_ed.lines[i].line_no = new_no[i];
+    strncpy(g_ed.lines[i].text, tmp, MP_LINE_LEN);
+    g_ed.lines[i].text[MP_LINE_LEN - 1] = 0;
+  }
+}
+
+static int edit_pick_new_line_no(uint8_t after_idx)
+{
+  int cur_no = g_ed.lines[after_idx].line_no;
+  int next_no = (after_idx + 1u < g_ed.count) ? g_ed.lines[after_idx + 1u].line_no : (cur_no + g_step);
+  if ((next_no - cur_no) >= 2) return cur_no + ((next_no - cur_no) / 2);
+
+  edit_renumber_program();
+  cur_no = g_ed.lines[after_idx].line_no;
+  next_no = (after_idx + 1u < g_ed.count) ? g_ed.lines[after_idx + 1u].line_no : (cur_no + g_step);
+  if ((next_no - cur_no) >= 2) return cur_no + ((next_no - cur_no) / 2);
+  return cur_no + 1;
+}
+
+static void edit_insert_line_after(uint8_t after_idx, const char *text)
+{
+  if (g_ed.count >= MP_MAX_LINES) return;
+
+  uint8_t pos = (uint8_t)(after_idx + 1u);
+  for (int i = (int)g_ed.count; i > (int)pos; i--)
+    g_ed.lines[i] = g_ed.lines[i - 1];
+
+  g_ed.lines[pos].line_no = edit_pick_new_line_no(after_idx);
+  strncpy(g_ed.lines[pos].text, text ? text : "", MP_LINE_LEN);
+  g_ed.lines[pos].text[MP_LINE_LEN - 1] = 0;
+  g_ed.count++;
+}
+
+static void edit_render(void)
+{
+  mp_puts("\x1b[2J\x1b[H"); /* clear + home */
+  mp_puts("MINIPASCAL EDIT  (Ctrl+Q exits, QUIT on empty line also exits)\r\n\r\n");
+
+  for (uint8_t i = 0; i < g_ed.count; i++)
+  {
+    char ln[16];
+    mp_itoa(g_ed.lines[i].line_no, ln);
+    if (i == g_edit_state.line_idx) mp_puts("> "); else mp_puts("  ");
+    mp_puts(ln); mp_puts(" ");
+    if (i == g_edit_state.line_idx) mp_puts(g_edit_state.buf);
+    else mp_puts(g_ed.lines[i].text);
+    mp_putcrlf();
+  }
+
+  /* Place cursor on the active line at the correct column. */
+  uint8_t row = (uint8_t)(3u + g_edit_state.line_idx);
+  char ln[16];
+  mp_itoa(g_ed.lines[g_edit_state.line_idx].line_no, ln);
+  uint8_t col = (uint8_t)(3u + (uint8_t)strlen(ln) + 1u + g_edit_state.cur);
+  char esc[32];
+  snprintf(esc, sizeof(esc), "\x1b[%u;%uH", (unsigned)row, (unsigned)col);
+  mp_puts(esc);
+}
+
+static void edit_exit(void)
+{
+  if (g_edit_state.active)
+    edit_store_to_ed(g_edit_state.line_idx);
+
+  if (g_edit_state.added_tail && g_ed.count > 0)
+  {
+    uint8_t last = (uint8_t)(g_ed.count - 1u);
+    if (g_ed.lines[last].text[0] == 0)
+      edit_delete_line_at(last);
+  }
+
+  g_edit = false;
+  g_edit_state = (mp_edit_t){0};
+  mp_puts("\r\nEDIT OFF\r\n");
+  mp_prompt();
+}
+
+static void edit_enter_new(void)
+{
+  ed_init(&g_ed);
+  g_ed.lines[0].line_no = 10;
+  g_ed.lines[0].text[0] = 0;
+  g_ed.count = 1;
+
+  g_edit = true;
+  g_edit_slot = 0;
+  g_edit_state = (mp_edit_t){0};
+  g_edit_state.active = 1u;
+  g_edit_state.added_tail = 1u;
+  g_edit_state.line_idx = 0u;
+  edit_load_from_ed(0u);
+  edit_render();
+}
+
+static bool edit_enter_slot(uint8_t slot)
+{
+  g_edit_state = (mp_edit_t){0};
+
+  bool ar = false;
+  if (!storage_load_slot(slot, &g_ed, &ar))
+  {
+    mp_puts("LOAD FAIL\r\n");
+    return false;
+  }
+
+  if (g_ed.count == 0)
+  {
+    g_ed.lines[0].line_no = 10;
+    g_ed.lines[0].text[0] = 0;
+    g_ed.count = 1;
+  }
+
+  /* Add a trailing empty line for easy appending. */
+  if (g_ed.count < MP_MAX_LINES)
+  {
+    uint8_t last = (uint8_t)(g_ed.count - 1u);
+    if (g_ed.lines[last].text[0] != 0)
+    {
+      g_ed.lines[g_ed.count].line_no = g_ed.lines[last].line_no + g_step;
+      g_ed.lines[g_ed.count].text[0] = 0;
+      g_ed.count++;
+      g_edit_state.added_tail = 1u;
+    }
+  }
+
+  g_edit = true;
+  g_edit_slot = slot;
+  g_edit_state.active = 1u;
+  g_edit_state.line_idx = 0u;
+  g_edit_state.cur = 0u;
+  edit_load_from_ed(0u);
+  edit_render();
+  return true;
+}
+
+static void edit_move_line(int dir)
+{
+  edit_store_to_ed(g_edit_state.line_idx);
+  if (dir < 0)
+  {
+    if (g_edit_state.line_idx > 0u) g_edit_state.line_idx--;
+  }
+  else
+  {
+    if (g_edit_state.line_idx + 1u < g_ed.count) g_edit_state.line_idx++;
+  }
+
+  g_edit_state.cur = g_edit_state.preferred_col;
+  edit_load_from_ed(g_edit_state.line_idx);
+}
+
+static void edit_backspace(void)
+{
+  if (g_edit_state.cur > 0u)
+  {
+    memmove(&g_edit_state.buf[g_edit_state.cur - 1u],
+            &g_edit_state.buf[g_edit_state.cur],
+            (size_t)(g_edit_state.len - g_edit_state.cur + 1u));
+    g_edit_state.cur--;
+    g_edit_state.len--;
+    return;
+  }
+
+  if (g_edit_state.line_idx == 0u) return;
+
+  /* Merge with previous line. */
+  char merged[MP_LINE_LEN];
+  const char *prev = g_ed.lines[g_edit_state.line_idx - 1u].text;
+  size_t prev_len = strnlen(prev, MP_LINE_LEN - 1);
+  if (prev_len + g_edit_state.len >= (MP_LINE_LEN - 1u)) return;
+  memcpy(merged, prev, prev_len);
+  memcpy(&merged[prev_len], g_edit_state.buf, g_edit_state.len);
+  merged[prev_len + g_edit_state.len] = 0;
+
+  strncpy(g_ed.lines[g_edit_state.line_idx - 1u].text, merged, MP_LINE_LEN);
+  g_ed.lines[g_edit_state.line_idx - 1u].text[MP_LINE_LEN - 1] = 0;
+  edit_delete_line_at(g_edit_state.line_idx);
+  g_edit_state.line_idx--;
+  strncpy(g_edit_state.buf, merged, MP_LINE_LEN);
+  g_edit_state.buf[MP_LINE_LEN - 1] = 0;
+  g_edit_state.len = (uint8_t)strnlen(g_edit_state.buf, MP_LINE_LEN - 1);
+  g_edit_state.cur = (uint8_t)prev_len;
+}
+
+static void edit_delete(void)
+{
+  if (g_edit_state.cur < g_edit_state.len)
+  {
+    memmove(&g_edit_state.buf[g_edit_state.cur],
+            &g_edit_state.buf[g_edit_state.cur + 1u],
+            (size_t)(g_edit_state.len - g_edit_state.cur));
+    g_edit_state.len--;
+    return;
+  }
+
+  if (g_edit_state.line_idx + 1u >= g_ed.count) return;
+
+  const char *next = g_ed.lines[g_edit_state.line_idx + 1u].text;
+  size_t next_len = strnlen(next, MP_LINE_LEN - 1);
+  if ((size_t)g_edit_state.len + next_len >= (MP_LINE_LEN - 1u)) return;
+  memcpy(&g_edit_state.buf[g_edit_state.len], next, next_len);
+  g_edit_state.len = (uint8_t)(g_edit_state.len + next_len);
+  g_edit_state.buf[g_edit_state.len] = 0;
+  edit_delete_line_at((uint8_t)(g_edit_state.line_idx + 1u));
+}
+
+static void edit_insert_char(char c)
+{
+  if (g_edit_state.len >= (MP_LINE_LEN - 1u)) return;
+  memmove(&g_edit_state.buf[g_edit_state.cur + 1u],
+          &g_edit_state.buf[g_edit_state.cur],
+          (size_t)(g_edit_state.len - g_edit_state.cur + 1u));
+  g_edit_state.buf[g_edit_state.cur] = c;
+  g_edit_state.cur++;
+  g_edit_state.len++;
+}
+
+static void edit_enter_key(void)
+{
+  /* "QUIT" on its own line exits edit mode. */
+  {
+    char tmp[MP_LINE_LEN];
+    strncpy(tmp, g_edit_state.buf, MP_LINE_LEN);
+    tmp[MP_LINE_LEN - 1] = 0;
+    char *p = tmp;
+    while (*p == ' ' || *p == '\t') p++;
+    char *e = p + strlen(p);
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t')) { e--; }
+    *e = 0;
+    if (mp_stricmp(p, "QUIT") == 0)
+    {
+      edit_exit();
+      return;
+    }
+  }
+
+  if (g_ed.count == 0) return;
+
+  if (g_ed.count >= MP_MAX_LINES) return;
+
+  if (g_edit_state.line_idx >= g_ed.count) return;
+
+  if (g_edit_state.cur > g_edit_state.len) g_edit_state.cur = g_edit_state.len;
+
+  if (g_edit_state.len >= (MP_LINE_LEN - 1u)) g_edit_state.cur = g_edit_state.len;
+
+  /* Split line at cursor and insert the tail as a new line below. */
+  char tail[MP_LINE_LEN];
+  uint8_t tail_len = (uint8_t)(g_edit_state.len - g_edit_state.cur);
+  memcpy(tail, &g_edit_state.buf[g_edit_state.cur], tail_len);
+  tail[tail_len] = 0;
+
+  g_edit_state.buf[g_edit_state.cur] = 0;
+  g_edit_state.len = g_edit_state.cur;
+  edit_store_to_ed(g_edit_state.line_idx);
+ 
+  edit_insert_line_after(g_edit_state.line_idx, tail);
+  edit_renumber_program();
+  g_edit_state.line_idx++;
+  g_edit_state.cur = 0u;
+  g_edit_state.preferred_col = 0u;
+  edit_load_from_ed(g_edit_state.line_idx);
+}
+
+static void edit_handle_escape(char c)
+{
+  if (g_edit_state.esc_state == 1u)
+  {
+    if (c == '[') { g_edit_state.esc_state = 2u; g_edit_state.esc_param = 0u; return; }
+    g_edit_state.esc_state = 0u;
+    return;
+  }
+
+  if (g_edit_state.esc_state == 2u)
+  {
+    if (c >= '0' && c <= '9') { g_edit_state.esc_param = (uint8_t)(c - '0'); return; }
+    if (c == '~')
+    {
+      if (g_edit_state.esc_param == 3u) edit_delete();
+      g_edit_state.esc_state = 0u;
+      return;
+    }
+
+    switch (c)
+    {
+      case 'A': edit_move_line(-1); break;
+      case 'B': edit_move_line(+1); break;
+      case 'C': if (g_edit_state.cur < g_edit_state.len) g_edit_state.cur++; break;
+      case 'D': if (g_edit_state.cur > 0u) g_edit_state.cur--; break;
+      case 'H': g_edit_state.cur = 0u; break;
+      case 'F': g_edit_state.cur = g_edit_state.len; break;
+      default: break;
+    }
+
+    g_edit_state.preferred_col = g_edit_state.cur;
+    g_edit_state.esc_state = 0u;
+    return;
+  }
 }
 static void compile_or_report(void){
   g_have_prog=false;
@@ -1519,40 +1978,6 @@ static void cmd_stop(void){
   mp_puts("STOP\r\n");
 }
 
-static void handle_edit_line(const char *line){
-  /* In EDIT mode, QUIT finishes editing (so END can be used in code). */
-  if (!mp_stricmp(line, "QUIT")){
-    g_edit=false;
-    mp_puts("EDIT OFF\r\n");
-    return;
-  }
-
-  int line_no = g_next_line;
-  const char *p = line;
-  while (*p==' '||*p=='\t') p++;
-  int ln=0;
-  const char *p_num = p;
-  if (parse_int(&p_num,&ln)){
-    if (*p_num==' '||*p_num=='\t'){
-      while (*p_num==' '||*p_num=='\t') p_num++;
-      if (ln > 0){
-        line_no = ln;
-        line = p_num;
-      }
-    }
-  }
-
-  /* Store the line at the current (or provided) line number. */
-  if (!ed_set(&g_ed, line_no, line)){
-    mp_puts("ERR: Line store failed");
-    return;
-  }
-
-  /* Move to next line number - no confirmation, just next prompt */
-  if (line_no == g_next_line) g_next_line += g_step;
-  else g_next_line = line_no + g_step;
-}
-
 static bool parse_slot_opt(const char *args, uint8_t *slot_out){
   const char *p=args;
   int s=0;
@@ -1573,11 +1998,7 @@ static void handle_line(char *line){
   while (*line==' '||*line=='\t') line++;
   if (!*line && !g_edit) return;  /* Empty line in normal mode - skip */
   if (!*line) return;  /* Empty line in EDIT mode - just show next prompt */
-
-  if (g_edit){
-    handle_edit_line(line);
-    return;
-  }
+  if (g_edit) return;
 
   if (isdigit((unsigned char)line[0])){
     const char *p=line;
@@ -1662,16 +2083,13 @@ static void handle_line(char *line){
     return;
   }
   if (!mp_stricmp(cmd,"EDIT")) {
-    /* Auto line-number mode:
-       - You type Pascal statements line by line, WITHOUT numbers.
-       - The monitor assigns 10,20,30,... (or your STEP) automatically.
-       - To leave EDIT mode, type QUIT on its own line.
-       - Always starts fresh (clears previous code).
-    */
-    ed_init(&g_ed);  /* Clear previous code */
-    g_edit=true;
-    g_next_line = 10;
-    mp_puts("NEW PROGRAM (type QUIT to finish, no line numbers)\r\n");
+    uint8_t s = 0;
+    if (*args && parse_slot_opt(args, &s))
+    {
+      (void)edit_enter_slot(s);
+      return;
+    }
+    edit_enter_new();
     return;
   }
 
@@ -1716,9 +2134,9 @@ static void handle_line(char *line){
 }
 
 static void mp_indicate_program_start(void){
-  if (mp_usb_connected()) return;
+  if (mp_hal_usb_connected()) return;
   IND_LED_On();
-  HAL_Delay(200);
+  LP_DELAY(200);
   IND_LED_Off();
 }
 
@@ -1738,7 +2156,7 @@ void mp_init(void){
     loaded = true;
   }
 
-  if (loaded && !mp_usb_connected()){
+  if (loaded && (mp_hal_usb_connected() == 0)){
     compile_or_report();
     if (g_have_prog) { vm_reset(&g_vm); mp_indicate_program_start(); }
   }
@@ -1766,7 +2184,58 @@ void mp_stop_session(void){ g_session_active=false; }
 bool mp_is_active(void){ return g_session_active; }
 bool mp_exit_pending(void){ return g_exit_pending; }
 
+static void edit_feed_char(char c)
+{
+  if (!g_edit_state.active) return;
+
+  /* Ctrl+Q exits edit mode. */
+  if ((uint8_t)c == 0x11u)
+  {
+    edit_exit();
+    return;
+  }
+
+  if ((uint8_t)c == 0x1Bu)
+  {
+    g_edit_state.esc_state = 1u;
+    return;
+  }
+
+  if (g_edit_state.esc_state != 0u)
+  {
+    edit_handle_escape(c);
+    edit_render();
+    return;
+  }
+
+  if (c == '\r' || c == '\n')
+  {
+    edit_enter_key();
+    if (g_edit) edit_render();
+    return;
+  }
+
+  if ((uint8_t)c == 0x08u || (uint8_t)c == 0x7Fu)
+  {
+    edit_backspace();
+    edit_render();
+    return;
+  }
+
+  if ((uint8_t)c < 0x20u) return;
+
+  edit_insert_char(c);
+  g_edit_state.preferred_col = g_edit_state.cur;
+  edit_render();
+}
+
 void mp_feed_char(char c){
+  if (g_edit)
+  {
+    edit_feed_char(c);
+    return;
+  }
+
   static char line[MP_LINE_LEN];
   static uint16_t n=0;
   
@@ -1801,7 +2270,7 @@ void mp_task(void){ mp_poll(); if (g_exit_pending) g_session_active=false; }
 void mp_autorun_poll(void){
   static uint8_t autorun_done = 0;
 
-  if (mp_usb_connected()){
+  if (mp_hal_usb_connected()){
     autorun_done = 0;
     return;
   }
@@ -1828,16 +2297,38 @@ void mp_poll(void){
   if (g_usb_detach_req){
     g_usb_detach_req = 0;
     g_session_active = false;
-    /* If nothing is running, ensure default program starts in battery mode. */
-    if (!(g_vm.running && g_have_prog)){
-      g_run_slot_req = 1;
+  }
+
+  if (g_run_next_req)
+  {
+    g_run_next_req = 0;
+    if ((mp_hal_usb_connected() == 0) && !g_session_active)
+    {
+      uint8_t next = 0;
+      if (g_first_program_slot != 0)
+      {
+        next = slot_find_next_program(g_slot, +1);
+        if (next == 0) next = g_first_program_slot;
+      }
+
+      if (next != 0 && next != g_slot)
+      {
+        bool ar = false;
+        if (storage_load_slot(next, &g_ed, &ar))
+        {
+          g_slot = next;
+          refresh_program_slot_cache();
+          compile_or_report();
+          if (g_have_prog) { vm_reset(&g_vm); mp_indicate_program_start(); }
+        }
+      }
     }
   }
 
   if (g_run_loaded_req)
   {
     g_run_loaded_req = 0;
-    if (!mp_usb_connected() && !g_session_active)
+    if ((mp_hal_usb_connected() == 0) && !g_session_active)
     {
       if (!(g_vm.running && g_have_prog))
       {
@@ -1850,7 +2341,7 @@ void mp_poll(void){
   uint8_t req = g_run_slot_req;
   if (req != 0){
     g_run_slot_req = 0;
-    if (!mp_usb_connected() && !g_session_active){
+    if ((mp_hal_usb_connected() == 0) && !g_session_active){
       bool ar = false;
       uint8_t slot = req;
       bool loaded = storage_load_slot(slot, &g_ed, &ar);
@@ -1885,8 +2376,8 @@ void mp_poll(void){
         abort_latched = 1;
         g_vm.stop_req = true;
         /* Long-hold B2: stop program, switch off lamp, and on battery go to STOP2. */
-        Lamp_RequestOff(mp_usb_connected() ? 0u : 1u);
-        if (mp_usb_connected()){
+        Lamp_RequestOff((mp_hal_usb_connected() != 0) ? 0u : 1u);
+        if (mp_hal_usb_connected()){
           mp_puts("\r\nABORT (B2 held)\r\n");
         }
       }
@@ -1924,121 +2415,41 @@ void mp_poll(void){
   }
 }
 
-/* ============================ Buttons (battery mode) ============================ */
-#define MP_BTN_DEBOUNCE_MS 30u
-#define MP_BTN_LONG_MS     2000u
-
-#define MP_BTN_EVT_B1 (1u<<0)
-#define MP_BTN_EVT_B2 (1u<<1)
-#define MP_BTN_EVT_BL (1u<<2)
-
-typedef struct {
-  uint8_t raw;
-  uint8_t stable;
-  uint8_t long_fired;
-  uint32_t change_ms;
-  uint32_t press_ms;
-} mp_btn_t;
-
-static uint8_t mp_btn_update(mp_btn_t *b, uint8_t raw, uint32_t now_ms){
-  if (!b) return 0;
-  if (raw != b->raw){
-    b->raw = raw;
-    b->change_ms = now_ms;
-  }
-  if ((uint32_t)(now_ms - b->change_ms) >= MP_BTN_DEBOUNCE_MS && b->stable != b->raw){
-    b->stable = b->raw;
-    if (b->stable){
-      b->press_ms = now_ms;
-      b->long_fired = 0;
+/* Short press events latched for BTN() (0 none, 1=B1, 2=B2, 3=BL). */
+static uint8_t g_btn_short_events = 0;
+void mp_notify_button_short(uint8_t btn_id)
+{
+  if (btn_id == 1u)
+  {
+    /* On battery, B1 short press starts the program when idle (do not enqueue as event). */
+    if ((mp_hal_usb_connected() == 0) && (!g_vm.running || !g_have_prog))
+    {
+      mp_request_run_loaded();
+      return;
     }
-    return 1;
+
+    g_btn_short_events |= (1u << 0);
+    return;
   }
-  return 0;
+
+  if (btn_id == 2u)
+  {
+    g_btn_short_events |= (1u << 1);
+    return;
+  }
+
+  if (btn_id == 3u)
+  {
+    g_btn_short_events |= (1u << 2);
+    return;
+  }
 }
 
-static uint8_t g_btn_short_events = 0;
-
-void mp_buttons_poll(void){
-  /*
-   * Button policy (battery mode):
-   * - Short press: delivered to Pascal (latched event).
-   * - Long press (>=2s): system command with higher priority.
-   *     - B1 long: switch to next non-empty program slot and run it.
-   *     - B2 long: reserved (abort is handled elsewhere via mp_hal_abort_pressed()).
-   *     - BL long: handled in main.c (STOP2 sleep).
-   */
-  static mp_btn_t s_b1 = {0}, s_b2 = {0}, s_bl = {0};
-
-  if (g_session_active) return;
-
-  uint32_t now = mp_hal_millis();
-
-  /* raw samples (active-high) */
-  uint8_t raw_b1 = (uint8_t)(HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_SET);
-  uint8_t raw_b2 = (uint8_t)(HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == GPIO_PIN_SET);
-  uint8_t raw_bl = (uint8_t)(HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin) == GPIO_PIN_SET);
-
-  (void)mp_btn_update(&s_b1, raw_b1, now);
-  (void)mp_btn_update(&s_b2, raw_b2, now);
-  (void)mp_btn_update(&s_bl, raw_bl, now);
-
-  /* Long-press actions (fire once per hold). */
-  if (s_b1.stable && !s_b1.long_fired && (uint32_t)(now - s_b1.press_ms) >= MP_BTN_LONG_MS)
-  {
-    s_b1.long_fired = 1u;
-
-    uint8_t new_slot = 0;
-    if (g_first_program_slot != 0)
-    {
-      new_slot = slot_find_next_program(g_slot, +1);
-      if (new_slot == 0) new_slot = g_first_program_slot;
-    }
-
-    if (new_slot != 0 && new_slot != g_slot)
-    {
-      bool ar = false;
-      if (storage_load_slot(new_slot, &g_ed, &ar))
-      {
-        g_slot = new_slot;
-        refresh_program_slot_cache();
-        compile_or_report();
-        if (g_have_prog) { vm_reset(&g_vm); mp_indicate_program_start(); }
-      }
-    }
-  }
-
-  /* Suppress short-press generation for buttons once they become a long-press. */
-  if (s_b2.stable && !s_b2.long_fired && (uint32_t)(now - s_b2.press_ms) >= MP_BTN_LONG_MS) s_b2.long_fired = 1u;
-  if (s_bl.stable && !s_bl.long_fired && (uint32_t)(now - s_bl.press_ms) >= MP_BTN_LONG_MS) s_bl.long_fired = 1u;
-
-  /* Short-press events are generated on release (only while a program is running). */
-  if (!s_b1.stable && s_b1.press_ms && !s_b1.long_fired)
-  {
-    if (g_vm.running && g_have_prog) g_btn_short_events |= MP_BTN_EVT_B1;
-    else
-    {
-      /* If VM is stopped, let short B1 act as a "run" button. */
-      compile_or_report();
-      if (g_have_prog) { vm_reset(&g_vm); mp_indicate_program_start(); }
-    }
-    s_b1.press_ms = 0;
-  }
-  if (!s_b2.stable && s_b2.press_ms && !s_b2.long_fired)
-  {
-    if (g_vm.running && g_have_prog) g_btn_short_events |= MP_BTN_EVT_B2;
-    s_b2.press_ms = 0;
-  }
-  if (!s_bl.stable && s_bl.press_ms && !s_bl.long_fired)
-  {
-    if (g_vm.running && g_have_prog) g_btn_short_events |= MP_BTN_EVT_BL;
-    s_bl.press_ms = 0;
-  }
-
-  /* Clear press_ms after long press is finished (released). */
-  if (!s_b1.stable && s_b1.long_fired) { s_b1.long_fired = 0; s_b1.press_ms = 0; }
-  if (!s_b2.stable && s_b2.long_fired) { s_b2.long_fired = 0; s_b2.press_ms = 0; }
-  if (!s_bl.stable && s_bl.long_fired) { s_bl.long_fired = 0; s_bl.press_ms = 0; }
+void mp_notify_button_long(uint8_t btn_id)
+{
+  /* Only battery mode uses long-press actions. */
+  if (mp_hal_usb_connected() != 0) return;
+  if (btn_id == 1u) g_run_next_req = 1u;
 }
 
 static bool time_read_ymdhms(int *yy, int *mo, int *dd, int *hh, int *mm, int *ss){
@@ -2104,12 +2515,16 @@ static bool is_time0_call(const char *line){
   return (*p==0);
 }
 
-/* ============================ Builtin functions ============================ */
+/*
+ * Builtin functions (runtime side).
+ * Each ID below matches builtin_id() and calls into the corresponding driver/library.
+ */
 int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
   switch(id){
+    /* ---------------- LED control (led.c, CTL_LEN power) ---------------- */
     case 1: /* led(...) */
       if (argc==2){ /* led(index, w) simple white */
-        led_power_ensure_on();
+        mp_hal_led_power_on();
         uint8_t idx = (argv[0]<=0)?0:(uint8_t)(argv[0]-1);
         uint8_t w = (argv[1]<0)?0:(argv[1]>255?255:(uint8_t)argv[1]);
         led_set_RGBW(idx, 0, 0, 0, w);
@@ -2117,7 +2532,7 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         return 0;
       }
       if (argc==5){
-        led_power_ensure_on();
+        mp_hal_led_power_on();
         uint8_t idx = (argv[0]<=0)?0:(uint8_t)(argv[0]-1);
         uint8_t r = (argv[1]<0)?0:(argv[1]>255?255:(uint8_t)argv[1]);
         uint8_t g = (argv[2]<0)?0:(argv[2]>255?255:(uint8_t)argv[2]);
@@ -2129,9 +2544,11 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
       }
       return -1;
 
-    case 2: /* wait(ms) handled specially => OP_SLEEP */
+    /* ---------------- Timing / sleep ---------------- */
+    case 2: /* delay(ms) is executed by the VM (OP_SLEEP). */
       return 0;
 
+    /* ---------------- Analog measurements (analog.c) ---------------- */
     case 3: /* battery() -> mV */
       if (argc==0){
         float v = ANALOG_GetBat();
@@ -2140,11 +2557,13 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
       }
       return -1;
 
+    /* RNG (main.c hrng). */
     case 4: /* rng() -> 0..255 */
       {
         uint32_t r=0; if (HAL_RNG_GenerateRandomNumber(&hrng,&r)==HAL_OK) return (int32_t)(r & 0xFF); return -1;
       }
 
+    /* ---------------- BME280 readings (bme280.c) ---------------- */
     case 5: /* temp() -> degC*10 */
       {
         float t=0.0f; if (T(&t)==HAL_OK) return (int32_t)(t*10.0f); return -1;
@@ -2157,22 +2576,19 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
       {
         float p=0.0f; if (P(&p)==HAL_OK) return (int32_t)(p*10.0f); return -1;
       }
-    case 8: /* btn() -> B1B2BL as decimal 0-111 */
-      {
-        uint8_t b1 = (uint8_t)HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin);
-        uint8_t b2 = (uint8_t)HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin);
-        uint8_t bl = (uint8_t)HAL_GPIO_ReadPin(BL_GPIO_Port, BL_Pin);
-        return (int32_t)(b1*100 + b2*10 + bl);
-      }
-    case 16: /* btne() -> next short-press event (0 none, 1=B1, 2=B2, 3=BL) */
+
+    /* ---------------- Buttons ---------------- */
+    case 16: /* btn() -> next short-press event (0 none, 1=B1, 2=B2, 3=BL) */
       if (argc==0){
         uint8_t e = g_btn_short_events;
-        if (e & MP_BTN_EVT_B1) { g_btn_short_events = (uint8_t)(e & (uint8_t)~MP_BTN_EVT_B1); return 1; }
-        if (e & MP_BTN_EVT_B2) { g_btn_short_events = (uint8_t)(e & (uint8_t)~MP_BTN_EVT_B2); return 2; }
-        if (e & MP_BTN_EVT_BL) { g_btn_short_events = (uint8_t)(e & (uint8_t)~MP_BTN_EVT_BL); return 3; }
+        if (e & (1u<<0)) { g_btn_short_events = (uint8_t)(e & (uint8_t)~(1u<<0)); return 1; }
+        if (e & (1u<<1)) { g_btn_short_events = (uint8_t)(e & (uint8_t)~(1u<<1)); return 2; }
+        if (e & (1u<<2)) { g_btn_short_events = (uint8_t)(e & (uint8_t)~(1u<<2)); return 3; }
         return 0;
       }
       return -1;
+
+    /* ---------------- Microphone ---------------- */
     case 9: /* mic() -> dbfs*100 (fault=-99900) */
       {
         const int32_t fault = -99900;
@@ -2184,7 +2600,7 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         }
 
         if (start != MIC_ERR_OK){
-          if (mp_usb_connected()){
+          if (mp_hal_usb_connected()){
             char b[160];
             const char *msg = MIC_LastErrorMsg();
             snprintf(b, sizeof(b), "[mic] start=%s(%ld) msg=%s\r\n",
@@ -2206,7 +2622,7 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         }
 
         if (st != MIC_ERR_OK){
-          if (mp_usb_connected()){
+          if (mp_hal_usb_connected()){
             char b[220];
             const char *msg = MIC_LastErrorMsg();
             int32_t last_dbfs_x100 = (int32_t)(MIC_LastDbFS() * 100.0f);
@@ -2223,7 +2639,9 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
 
         return (int32_t)(dbfs * 100.0f);
       }
-    case 10: /* time() or time(yy,mo,dd,hh,mm) */
+
+    /* ---------------- RTC clock + alarm ---------------- */
+    case 10: /* time() or time(sel) */
       if (argc==0){
         time_update_vars(g_vm.vars);
         return 0;
@@ -2241,6 +2659,8 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
           default: return -1;
         }
       }
+      return -1;
+    case 17: /* settime(yy,mo,dd,hh,mm) or settime(hh,mm,ss) */
       if (argc==5){
         uint8_t yy = (argv[0]<0)?0:(argv[0]>99?99:(uint8_t)argv[0]);
         uint8_t mo = (argv[1]<1)?1:(argv[1]>12?12:(uint8_t)argv[1]);
@@ -2259,17 +2679,21 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
         if (!time_read_ymdhms(&yy,&mo,&dd,&hh,&mm,&ss)) return -1;
         char buf[RTC_DATETIME_STRING_SIZE];
-        snprintf(buf,sizeof(buf), "%02ld:%02ld:%02ld_%02d.%02d.%02d", (long)argv[0], (long)argv[1], (long)argv[2], yy, mo, dd);
+        snprintf(buf,sizeof(buf), "%02ld:%02ld:%02ld_%02d.%02d.%02d",
+                 (long)argv[0], (long)argv[1], (long)argv[2], yy, mo, dd);
         if (RTC_SetClock(buf)==HAL_OK){
           time_update_vars(g_vm.vars);
           return 0;
         }
+        return -1;
       }
       return -1;
-    case 11: /* setalarm(h,m,s) daily, alarm() -> active */
+    case 11: /* alarm() -> active (0/1) */
       if (argc==0){
         return (int32_t)RTC_AlarmTrigger;
       }
+      return -1;
+    case 18: /* setalarm(hh,mm[,duration_sec]) daily */
       if (argc>=2){
         uint8_t hh = (argv[0]<0)?0:(argv[0]>23?23:(uint8_t)argv[0]);
         uint8_t mm = (argv[1]<0)?0:(argv[1]>59?59:(uint8_t)argv[1]);
@@ -2277,6 +2701,8 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         if (RTC_SetDailyAlarm(hh, mm, dur)==HAL_OK) return 0;
       }
       return -1;
+
+    /* ---------------- Light sensor (analog.c) ---------------- */
     case 12: /* light() -> lux */
       if (argc==0){
         float l = ANALOG_GetLight();
@@ -2284,14 +2710,15 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         return (int32_t)(l + 0.5f);
       }
       return -1;
+
     case 13: /* ledon(r,g,b,w) */
       if (argc==0){
-        led_power_ensure_on();
+        mp_hal_led_power_on();
         led_render();
         return 0;
       }
       if (argc==4){
-        led_power_ensure_on();
+        mp_hal_led_power_on();
         uint8_t r = (argv[0]<0)?0:(argv[0]>255?255:(uint8_t)argv[0]);
         uint8_t g = (argv[1]<0)?0:(argv[1]>255?255:(uint8_t)argv[1]);
         uint8_t b = (argv[2]<0)?0:(argv[2]>255?255:(uint8_t)argv[2]);
@@ -2303,15 +2730,18 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
       return -1;
     case 14: /* ledoff() */
       if (argc==0){
-        led_power_ensure_on();
+        mp_hal_led_power_on();
         led_set_all_RGBW(0, 0, 0, 0);
         led_render();
+        mp_hal_led_power_off();
         return 0;
       }
       return -1;
+
+    /* ---------------- Beeper (alarm.c) ---------------- */
     case 15: /* beep(freq,vol,ms) */
       if (argc==3){
-        led_power_ensure_on();
+        mp_hal_led_power_on();
         int32_t f = argv[0];
         int32_t v = argv[1];
         int32_t ms = argv[2];
@@ -2329,13 +2759,4 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
   }
 }
 
-int mp_hal_getchar(void){
-  /* Non-blocking: use USB CDC RX buffer? Not available here. Stubbed to -1. */
-  return -1;
-}
-void mp_hal_putchar(char c){
-  /* Routed via USB CLI printf helper */
-  char b[2]={c,0};
-  cdc_write_str(b);
-}
-uint32_t mp_hal_millis(void){ return HAL_GetTick(); }
+/* mp_hal_* hooks are implemented in main.c (board layer). */

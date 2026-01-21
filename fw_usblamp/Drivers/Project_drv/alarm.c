@@ -1,14 +1,6 @@
 /*
- * alarm.c - beeper driver pre LPTIM2, kanál 1
- *
- * LPTIM2 config requirements (CubeMX / main.c):
- *   - Instance = LPTIM2
- *   - Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC (internal kernel clock)
- *   - Kernel clock = HSI16 (16 MHz) - set in HAL_LPTIM_MspInit via RCC
- *   - Prescaler = LPTIM_PRESCALER_DIV16 => tick = 1 MHz
- *
- * PA4 must be configured as AF14 (LPTIM2_CH1) - see HAL_LPTIM_MspPostInit.
- * NVIC TIM7_LPTIM2_IRQn must be enabled; ISR must call HAL_LPTIM_IRQHandler(&hlptim2).
+ * alarm.c - Beeper driver using LPTIM2 CH1 (PA4 AF14).
+ * Requires TIM7_LPTIM2_IRQn and HAL_LPTIM_IRQHandler(&hlptim2) in the ISR.
  */
 
 #include "alarm.h"
@@ -120,7 +112,7 @@ static void alarm_start_it(uint16_t freq_hz, uint8_t volume, float time_s)
     }
 }
 
-/* HAL callback - musí byť povolený LPTIM2 IRQ + HAL_LPTIM_IRQHandler(&hlptim2) v ISR */
+/* HAL callback: enable TIM7_LPTIM2_IRQn and call HAL_LPTIM_IRQHandler(&hlptim2) in the ISR. */
 void HAL_LPTIM_AutoReloadMatchCallback(LPTIM_HandleTypeDef *hlptim)
 {
     if (hlptim != ALARM_LPTIM) return;
@@ -133,11 +125,9 @@ void HAL_LPTIM_AutoReloadMatchCallback(LPTIM_HandleTypeDef *hlptim)
         alarm_stop_from_isr();
 }
 
-/**
- * @brief Spusti beep na LPTIM2, CH1
- * @param freq_hz Frekvencia v Hz
- * @param volume Duty 0-50 (%) (50% = max)
- * @param time_s Trvanie v s
+/*
+ * Start a beep on LPTIM2 CH1.
+ * freq_hz: tone frequency in Hz, volume: duty 0..50 (%), time_s: duration in seconds.
  */
 void BEEP(uint16_t freq_hz, uint8_t volume, float time_s)
 {
@@ -161,40 +151,4 @@ void BEEP_Task(void)
 
     s_alarm_pending = 0u;
     alarm_start_it(s_alarm_req_freq_hz, s_alarm_req_volume, s_alarm_req_time_s);
-}
-
-void BEEP_Test1kHz(void)
-{
-    const uint16_t freq_hz = 1000u;
-    const uint8_t volume = 50u;
-
-    const uint32_t f = (uint32_t)freq_hz;
-    uint32_t ticks = (ALARM_LPTIM_CLK_HZ + (f / 2u)) / f;
-    if (ticks < 2u) ticks = 2u;
-    if (ticks > 65536u) ticks = 65536u;
-
-    const uint32_t arr = ticks - 1u;
-    /* CCR = ARR * volume / 100 => duty = CCR/ARR = volume% */
-    uint32_t pulse = (arr * (uint32_t)volume) / 100u;
-    if (pulse == 0u && volume > 0u) pulse = 1u;
-    if (pulse > arr) pulse = arr;
-
-    /* Stop any previous */
-    (void)HAL_LPTIM_PWM_Stop(ALARM_LPTIM, ALARM_CHANNEL);
-
-    /* Reset HAL state */
-    ALARM_LPTIM->State = HAL_LPTIM_STATE_READY;
-    ALARM_LPTIM->ChannelState[0] = HAL_LPTIM_CHANNEL_STATE_READY;
-
-    /* Configure */
-    ALARM_LPTIM->Init.Period = arr;
-    (void)HAL_LPTIM_Init(ALARM_LPTIM);
-
-    LPTIM_OC_ConfigTypeDef oc = {0};
-    oc.Pulse      = pulse;
-    oc.OCPolarity = LPTIM_OCPOLARITY_HIGH;
-    (void)HAL_LPTIM_OC_ConfigChannel(ALARM_LPTIM, &oc, ALARM_CHANNEL);
-
-    /* Start continuous PWM (no interrupts - for oscilloscope test only) */
-    (void)HAL_LPTIM_PWM_Start(ALARM_LPTIM, ALARM_CHANNEL);
 }

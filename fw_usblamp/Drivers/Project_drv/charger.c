@@ -1,13 +1,12 @@
 /*
- * charger.c - Battery charger management for STNS01
- *
- *  Created on: Jan 2, 2026
- *      Author: orgo
+ * charger.c - STNS01 charger control and status helpers.
+ * Implements a simple periodic state machine.
  */
 
 #include "charger.h"
 #include "main.h"
 #include "analog.h"
+#include "lp_delay.h"
 
 /* State machine states */
 static uint8_t charge_enabled = 0;
@@ -79,9 +78,9 @@ uint8_t CHARGER_GetStatus(void)
 {
     /* Read STA_CHG pin state multiple times to detect toggling (fault condition) */
     GPIO_PinState state1 = HAL_GPIO_ReadPin(STA_CHG_GPIO_Port, STA_CHG_Pin);
-    HAL_Delay(100); /* Wait 100ms */
+    LP_DELAY(100); /* Wait 100ms */
     GPIO_PinState state2 = HAL_GPIO_ReadPin(STA_CHG_GPIO_Port, STA_CHG_Pin);
-    HAL_Delay(100); /* Wait 100ms */
+    LP_DELAY(100); /* Wait 100ms */
     GPIO_PinState state3 = HAL_GPIO_ReadPin(STA_CHG_GPIO_Port, STA_CHG_Pin);
     
     /* Check if pin is toggling (fault condition) */
@@ -112,7 +111,7 @@ void CHARGER_Reset(void)
      * - End-of-charge
      */
     HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_RESET);
-    HAL_Delay(100);
+    LP_DELAY(100);
     HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_SET);
     
     /* Update internal state */

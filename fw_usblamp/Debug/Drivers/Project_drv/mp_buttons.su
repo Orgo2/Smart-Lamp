@@ -1,0 +1,8 @@
+../Drivers/Project_drv/mp_buttons.c:31:16:btn_update	24	static
+../Drivers/Project_drv/mp_buttons.c:50:6:MP_Buttons_Init	48	static
+../Drivers/Project_drv/mp_buttons.c:59:13:push_short	16	static
+../Drivers/Project_drv/mp_buttons.c:70:13:push_long	16	static
+../Drivers/Project_drv/mp_buttons.c:81:13:handle_release	32	static
+../Drivers/Project_drv/mp_buttons.c:92:6:MP_Buttons_Poll	40	static
+../Drivers/Project_drv/mp_buttons.c:107:13:MP_Buttons_PopShort	16	static
+../Drivers/Project_drv/mp_buttons.c:116:13:MP_Buttons_PopLong	16	static

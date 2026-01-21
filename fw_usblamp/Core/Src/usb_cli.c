@@ -8,6 +8,7 @@
 #include "charger.h"
 #include "mic.h"
 #include <MiniPascal.h>
+#include "memmon.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -486,33 +487,34 @@ static void print_help(void)
         "COMMANDS:\r\n"
         "  HELP\r\n"
         "  PING\r\n"
+        "  MEM         (RAM total/free/minfree)\r\n"
         "  PASCAL      (enter interpreter)\r\n"
-        "  LEDSTATUS\r\n"
         "  MICPROBE    (test mic SPI edges)\r\n"
+        "  CHARGER()   (battery %, state, VBAT)\r\n"
+        "  CHGRST()    (reset charger)\r\n"
         "\r\n"
         "PASCAL CALLS (same as interpreter):\r\n"
         "  LED(i,r,g,b,w)\r\n"
         "  LEDON(r,g,b,w)\r\n"
         "  LEDOFF()\r\n"
-        "  WAIT(ms) / DELAY(ms)\r\n"
+        "  DELAY(ms)\r\n"
         "  BATTERY()\r\n"
         "  LIGHT()\r\n"
-        "  BTN()\r\n"
-        "  BTNE()\r\n"
+        "  BTN()       (0=none, 1=B1, 2=B2, 3=BL)\r\n"
         "  RNG()\r\n"
         "  TEMP()\r\n"
         "  HUM()\r\n"
         "  PRESS()\r\n"
         "  MIC()\r\n"
-        "  TIME()\r\n"
-        "  TIME(yy,mo,dd,hh,mm)\r\n"
-        "  SETTIME(...)   alias for TIME\r\n"
-        "  ALARM() / ALARM(h,m,s)\r\n"
+        "  TIME()      (prints YY,MO,DD,HH,MM)\r\n"
+        "  TIME(sel)   (return part: 0=YY 1=MO 2=DD 3=HH 4=MM 5=SS)\r\n"
+        "  SETTIME(yy,mo,dd,hh,mm)   (set date+time, sec=0)\r\n"
+        "  SETTIME(hh,mm,ss)         (set time only, keep date)\r\n"
+        "            yy=0..99 mo=1..12 dd=1..31 hh=0..23 mm=0..59 ss=0..59\r\n"
+        "  ALARM()     (1 while alarm is running, else 0)\r\n"
+        "  SETALARM(hh,mm[,dur])     (daily alarm, dur seconds, 0 disables)\r\n"
+        "            hh=0..23 mm=0..59 dur=1..255 (default 30)\r\n"
         "  BEEP(freq,vol,ms)\r\n"
-        "\r\n"
-        "CHARGER (USB CLI only):\r\n"
-        "  CHARGER()    -> level %, state, voltage\r\n"
-        "  CHGRST()     -> reset charger\r\n"
         "\r\n"
         "NOTES:\r\n"
         "  Use parentheses and commas in calls.\r\n"
@@ -534,15 +536,6 @@ static void handle_line(char *line)
     while (n && (line[n-1] == '\r' || line[n-1] == '\n'))
         line[--n] = '\0';
 
-    if (strcmp(line, "ledstatus") == 0)
-    {
-        char buf[80];
-        led_hw_status(buf, sizeof(buf));
-        cdc_write_str(buf);
-        cdc_write_str("\r\n");
-        return;
-    }
-
     if (strcmp(line, "help") == 0)
     {
         print_help();
@@ -552,6 +545,19 @@ static void handle_line(char *line)
     if (strcmp(line, "ping") == 0)
     {
         cdc_write_str("pong\r\n");
+        return;
+    }
+
+    if (cli_stricmp(line, "mem") == 0)
+    {
+        uint32_t total = 0, free = 0, min_free = 0, min_tick_ms = 0;
+        char min_dt[RTC_DATETIME_STRING_SIZE];
+        memset(min_dt, 0, sizeof(min_dt));
+        MemMon_Get(&total, &free, &min_free, &min_tick_ms, min_dt, sizeof(min_dt));
+        cdc_writef("RAM: total=%luB free=%luB minfree=%luB\r\n",
+                   (unsigned long)total, (unsigned long)free, (unsigned long)min_free);
+        cdc_writef("RAM: minfree_at=%s uptime_ms=%lu\r\n",
+                   min_dt[0] ? min_dt : "N/A", (unsigned long)min_tick_ms);
         return;
     }
 

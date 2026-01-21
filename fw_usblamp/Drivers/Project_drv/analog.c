@@ -1,8 +1,6 @@
 /*
- * analog.c
- *
- *  Created on: Dec 13, 2025
- *      Author: orgo
+ * analog.c - Analog measurements (light sensor, battery, VCC).
+ * Uses CubeMX-configured ADC1 in single-shot mode (no DMA).
  */
 
 #include "analog.h"

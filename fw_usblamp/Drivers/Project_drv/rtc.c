@@ -1,10 +1,6 @@
 /*
- * rtc.c - RTC driver using HAL from main.c
- *
- *  Created on: Dec 13, 2025
- *      Author: orgo
- * 
- *  Uses RTC handle (hrtc) initialized by CubeMX in main.c
+ * rtc.c - RTC helpers (time/date + alarm trigger flag).
+ * Uses CubeMX-initialized HAL RTC handle (hrtc).
  */
 
 #include "rtc.h"
@@ -12,10 +8,10 @@
 #include <stdio.h>
 #include <string.h>
 
-// External RTC handle from main.c (initialized by MX_RTC_Init)
+/* External RTC handle from main.c (initialized by MX_RTC_Init). */
 extern RTC_HandleTypeDef hrtc;
 
-// Alarm duration tracking (no callbacks, only trigger flag)
+/* Alarm duration tracking (trigger flag only). */
 static uint8_t alarm_duration_sec = 0;
 static uint8_t alarm_elapsed_sec = 0;
 static uint8_t alarm_active = 0;
@@ -31,8 +27,7 @@ static volatile uint8_t alarm_cfg_valid = 0;
 
 HAL_StatusTypeDef RTC_Init(void)
 {
-    // RTC is already initialized by MX_RTC_Init() in main.c
-    // This function is just a placeholder for compatibility
+    /* RTC is initialized by CubeMX (MX_RTC_Init); keep this for API compatibility. */
     return HAL_OK;
 }
 
@@ -46,19 +41,18 @@ HAL_StatusTypeDef RTC_ReadClock(char *datetime_str)
         return HAL_ERROR;
     }
     
-    // Read time (reading time locks date register until date is read)
+    /* Read time then date to unlock shadow registers. */
     if (HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
     {
         return HAL_ERROR;
     }
     
-    // Read date (this unlocks the time register)
     if (HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN) != HAL_OK)
     {
         return HAL_ERROR;
     }
     
-    // Format: "HH:MM:SS_RR.MM.DD"
+    /* Format: "HH:MM:SS_YY.MM.DD". */
     snprintf(datetime_str, RTC_DATETIME_STRING_SIZE,
              "%02d:%02d:%02d_%02d.%02d.%02d",
              sTime.Hours,
@@ -82,21 +76,21 @@ HAL_StatusTypeDef RTC_SetClock(const char *datetime_str)
         return HAL_ERROR;
     }
     
-    // Parse format: "HH:MM:SS_RR.MM.DD"
+    /* Parse "HH:MM:SS_YY.MM.DD". */
     if (sscanf(datetime_str, "%02d:%02d:%02d_%02d.%02d.%02d",
                &hours, &minutes, &seconds, &year, &month, &day) != 6)
     {
         return HAL_ERROR;
     }
     
-    // Validate ranges
+    /* Validate ranges. */
     if (hours > 23 || minutes > 59 || seconds > 59 ||
         year > 99 || month < 1 || month > 12 || day < 1 || day > 31)
     {
         return HAL_ERROR;
     }
     
-    // Set time
+    /* Set time. */
     sTime.Hours = hours;
     sTime.Minutes = minutes;
     sTime.Seconds = seconds;
@@ -108,7 +102,7 @@ HAL_StatusTypeDef RTC_SetClock(const char *datetime_str)
         return HAL_ERROR;
     }
     
-    // Set date
+    /* Set date. */
     sDate.Year = year;
     sDate.Month = month;
     sDate.Date = day;
@@ -134,7 +128,7 @@ HAL_StatusTypeDef RTC_SetAlarm(const char *alarm_str, uint8_t duration_sec, uint
         return HAL_ERROR;
     }
     
-    // Check if alarm should be disabled (single "0" character or duration 0)
+    /* Disable alarm if alarm_str is "0" or duration is 0. */
     if ((alarm_str[0] == '0' && alarm_str[1] == '\0') || duration_sec == 0)
     {
         alarm_active = 0;
@@ -150,25 +144,25 @@ HAL_StatusTypeDef RTC_SetAlarm(const char *alarm_str, uint8_t duration_sec, uint
         return HAL_OK;
     }
     
-    // Parse format: "HH:MM:SS"
+    /* Parse "HH:MM:SS". */
     if (sscanf(alarm_str, "%02d:%02d:%02d", &hours, &minutes, &seconds) != 3)
     {
         return HAL_ERROR;
     }
     
-    // Validate ranges
+    /* Validate ranges. */
     if (hours > 23 || minutes > 59 || seconds > 59)
     {
         return HAL_ERROR;
     }
     
-    // Store duration
+    /* Store duration and clear trigger state. */
     alarm_duration_sec = duration_sec;
     alarm_elapsed_sec = 0;
     alarm_active = 0;
     RTC_AlarmTrigger = 0;
     
-    // Configure alarm
+    /* Configure alarm A. */
     sAlarm.AlarmTime.Hours = hours;
     sAlarm.AlarmTime.Minutes = minutes;
     sAlarm.AlarmTime.Seconds = seconds;

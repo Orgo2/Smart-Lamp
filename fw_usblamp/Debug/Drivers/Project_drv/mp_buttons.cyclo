@@ -1,0 +1,8 @@
+../Drivers/Project_drv/mp_buttons.c:31:16:btn_update	6
+../Drivers/Project_drv/mp_buttons.c:50:6:MP_Buttons_Init	1
+../Drivers/Project_drv/mp_buttons.c:59:13:push_short	5
+../Drivers/Project_drv/mp_buttons.c:70:13:push_long	5
+../Drivers/Project_drv/mp_buttons.c:81:13:handle_release	4
+../Drivers/Project_drv/mp_buttons.c:92:6:MP_Buttons_Poll	4
+../Drivers/Project_drv/mp_buttons.c:107:13:MP_Buttons_PopShort	4
+../Drivers/Project_drv/mp_buttons.c:116:13:MP_Buttons_PopLong	4
