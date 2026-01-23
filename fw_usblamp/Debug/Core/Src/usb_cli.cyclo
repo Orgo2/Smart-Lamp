@@ -25,6 +25,6 @@
 ../Core/Src/usb_cli.c:474:6:USB_CLI_NotifyDetach	2
 ../Core/Src/usb_cli.c:484:13:print_help	1
 ../Core/Src/usb_cli.c:529:13:handle_line	19
-../Core/Src/usb_cli.c:619:6:USB_CLI_Init	1
-../Core/Src/usb_cli.c:628:9:USB_CLI_IsConnected	1
-../Core/Src/usb_cli.c:633:6:USB_CLI_Task	19
+../Core/Src/usb_cli.c:621:6:USB_CLI_Init	1
+../Core/Src/usb_cli.c:630:9:USB_CLI_IsConnected	1
+../Core/Src/usb_cli.c:635:6:USB_CLI_Task	19

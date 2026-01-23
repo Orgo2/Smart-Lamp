@@ -1,6 +1,7 @@
-../Drivers/Project_drv/led.c:36:20:put_byte_msb	24	static
-../Drivers/Project_drv/led.c:45:6:led_set_RGBW	24	static
-../Drivers/Project_drv/led.c:54:6:led_set_RGB	32	static
-../Drivers/Project_drv/led.c:59:6:led_set_all_RGBW	40	static
-../Drivers/Project_drv/led.c:65:6:led_set_all_RGB	24	static
-../Drivers/Project_drv/led.c:76:6:led_render	24	static
+../Drivers/Project_drv/led.c:15:6:HAL_TIM_PWM_PulseFinishedCallback	16	static
+../Drivers/Project_drv/led.c:44:20:put_byte_msb	24	static
+../Drivers/Project_drv/led.c:53:6:led_set_RGBW	24	static
+../Drivers/Project_drv/led.c:62:6:led_set_RGB	32	static
+../Drivers/Project_drv/led.c:67:6:led_set_all_RGBW	40	static
+../Drivers/Project_drv/led.c:73:6:led_set_all_RGB	24	static
+../Drivers/Project_drv/led.c:84:6:led_render	32	static,ignoring_inline_asm

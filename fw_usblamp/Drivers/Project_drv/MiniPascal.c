@@ -2147,18 +2147,13 @@ void mp_init(void){
   g_step=10;
   g_slot=1;
 
-  bool loaded=false;
-  bool ar=false;
   refresh_program_slot_cache();
   uint8_t slot = g_first_program_slot;
-  if (slot != 0 && storage_load_slot(slot, &g_ed, &ar)){
+  if (slot != 0)
+  {
+    bool ar = false;
+    (void)storage_load_slot(slot, &g_ed, &ar);
     g_slot = slot;
-    loaded = true;
-  }
-
-  if (loaded && (mp_hal_usb_connected() == 0)){
-    compile_or_report();
-    if (g_have_prog) { vm_reset(&g_vm); mp_indicate_program_start(); }
   }
 }
 
@@ -2169,6 +2164,16 @@ void mp_request_run_slot(uint8_t slot){
 }
 void mp_request_run_loaded(void){ g_run_loaded_req = 1; }
 void mp_request_usb_detach(void){ g_usb_detach_req = 1; }
+
+void mp_force_stop(void)
+{
+  g_vm.running = false;
+  g_vm.sleeping = false;
+  g_vm.stop_req = false;
+  g_run_slot_req = 0u;
+  g_run_loaded_req = 0u;
+  g_run_next_req = 0u;
+}
 
 void mp_start_session(void){
   g_session_active = true;

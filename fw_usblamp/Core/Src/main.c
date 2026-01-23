@@ -108,6 +108,10 @@ static void LowBattery_Task(void);
 static void LowBattery_EarlyGate(void);
 static void NoProgram_SleepUntilUSB(void);
 static void EnterStop(void);
+static void Power_MinimizeLoads(void);
+static void EnterShutdown(void);
+static void B2_Hold_Service_NoSleep(uint32_t now_ms);
+static void B2_Hold_Service_Blocking(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -121,7 +125,7 @@ static volatile uint8_t s_stop2_armed = 0u;
 static volatile uint8_t s_stop2_woke_by_b1 = 0u;
 
 /* Battery policy: after USB detach, do not autorun; wait in STOP2 for B1 hold. */
-static volatile uint8_t s_battery_run_allowed = 1u;
+static volatile uint8_t s_battery_run_allowed = 0u;
 
 /* First-stage GPIO init (bootloader entry check) should not enable EXTI NVIC. */
 static volatile uint8_t s_gpio_skip_exti_nvic = 0u;
@@ -236,6 +240,10 @@ int main(void)
           CHARGER_Reset();
           s_usb_chgrst_done = 1u;
         }
+
+        /* USB connected: stop any battery program and blank LEDs. */
+        mp_force_stop();
+        Power_MinimizeLoads();
       }
 
       /* Fallback: if EXTI detach interrupt is missed, still switch to battery mode. */
@@ -292,6 +300,8 @@ int main(void)
       BEEP_Task();
       MIC_Task();
       BL_Task();
+      /* Battery safety: B2 hold >=2s forces shutdown even if program is running. */
+      B2_Hold_Service_NoSleep(HAL_GetTick());
       MemMon_Task();
       /* Power save: sleep until an interrupt (USB/UART/EXTI/SysTick...). */
       __WFI();
@@ -665,42 +675,6 @@ static void MX_RTC_Init(void)
   }
   /* USER CODE END Check_RTC_BKUP */
 
-  /** Initialize RTC and set the Time and Date
-  */
-  sTime.Hours = 0x0;
-  sTime.Minutes = 0x0;
-  sTime.Seconds = 0x0;
-  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
-  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
-  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
-  sDate.Month = RTC_MONTH_JANUARY;
-  sDate.Date = 0x1;
-  sDate.Year = 0x0;
-
-  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Enable the Alarm A
-  */
-  sAlarm.AlarmTime.Hours = 0x0;
-  sAlarm.AlarmTime.Minutes = 0x0;
-  sAlarm.AlarmTime.Seconds = 0x0;
-  sAlarm.AlarmTime.SubSeconds = 0x0;
-  sAlarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY|RTC_ALARMMASK_SECONDS;
-  sAlarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
-  sAlarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
-  sAlarm.AlarmDateWeekDay = 0x1;
-  sAlarm.Alarm = RTC_ALARM_A;
-  if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
@@ -993,6 +967,59 @@ void mp_hal_led_power_off(void)
   HAL_GPIO_WritePin(CTL_LEN_GPIO_Port, CTL_LEN_Pin, GPIO_PIN_RESET);
 }
 
+/* Battery-only hold actions sampled while awake (SysTick runs only outside STOP2). */
+#define BL_SLEEP_HOLD_MS 2000u
+#define BL_ACTIVE_STATE GPIO_PIN_SET
+static volatile uint32_t s_bl_hold_ms = 0u;
+static volatile uint8_t s_bl_sleep_req = 0u;
+
+#define B2_SHUTDOWN_HOLD_MS 2000u
+#define B2_ACTIVE_STATE GPIO_PIN_SET
+static uint32_t s_b2_hold_start_ms = 0u;
+
+static void B2_Hold_Service_NoSleep(uint32_t now_ms)
+{
+  if (USB_IsPresent() != 0u)
+  {
+    s_b2_hold_start_ms = 0u;
+    return;
+  }
+
+  if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == B2_ACTIVE_STATE)
+  {
+    if (s_b2_hold_start_ms == 0u) s_b2_hold_start_ms = now_ms;
+    if ((uint32_t)(now_ms - s_b2_hold_start_ms) >= B2_SHUTDOWN_HOLD_MS)
+      EnterShutdown();
+  }
+  else
+  {
+    s_b2_hold_start_ms = 0u;
+  }
+}
+
+static void B2_Hold_Service_Blocking(void)
+{
+  if (USB_IsPresent() != 0u)
+  {
+    s_b2_hold_start_ms = 0u;
+    return;
+  }
+
+  if (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) != B2_ACTIVE_STATE)
+  {
+    s_b2_hold_start_ms = 0u;
+    return;
+  }
+
+  while (HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin) == B2_ACTIVE_STATE)
+  {
+    B2_Hold_Service_NoSleep(HAL_GetTick());
+    HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+  }
+
+  s_b2_hold_start_ms = 0u;
+}
+
 static volatile uint8_t s_mp_wut_fired = 0u;
 void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc_ptr)
 {
@@ -1005,7 +1032,10 @@ static void lp_delay_sleep_ms(uint32_t ms)
   if (ms == 0u) return;
   uint32_t start = HAL_GetTick();
   while ((uint32_t)(HAL_GetTick() - start) < ms)
+  {
+    B2_Hold_Service_Blocking();
     HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+  }
 }
 
 static uint8_t lp_delay_rtc_ready(void)
@@ -1035,6 +1065,7 @@ void LP_DELAY(uint32_t ms)
     uint32_t chunk_ms = ms;
     if (chunk_ms > 32000u) chunk_ms = 32000u;
 
+    B2_Hold_Service_Blocking();
     uint32_t ticks = (chunk_ms * 2048u + 999u) / 1000u;
     if (ticks < 1u) ticks = 1u;
     if (ticks > 65536u) ticks = 65536u;
@@ -1052,9 +1083,13 @@ void LP_DELAY(uint32_t ms)
     {
       while (!s_mp_wut_fired)
       {
+        B2_Hold_Service_Blocking();
         __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
         HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
         SystemClock_Config();
+
+        /* If we woke because of B2, stay awake in light sleep so HAL_GetTick() can count the 2s hold. */
+        B2_Hold_Service_Blocking();
       }
       (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
     }
@@ -1185,12 +1220,6 @@ void MemMon_Get(uint32_t *out_total, uint32_t *out_free, uint32_t *out_min_free,
   }
 }
 
-/* BL hold-to-stop (active high, sampled in SysTick). */
-#define BL_SLEEP_HOLD_MS 2000u
-#define BL_ACTIVE_STATE GPIO_PIN_SET
-static volatile uint32_t s_bl_hold_ms = 0u;
-static volatile uint8_t s_bl_sleep_req = 0u;
-
 static void Power_MinimizeLoads(void)
 {
     mp_request_stop();
@@ -1227,6 +1256,17 @@ static void EnterStop(void)
     {
         Power_MinimizeLoads();
 
+        /* If B1 is already held (e.g., wake from shutdown), accept it without entering STOP2. */
+        if (B1_WaitHeld(B1_WAKE_HOLD_MS))
+        {
+            s_battery_run_allowed = 1u;
+            mp_request_run_loaded();
+            return;
+        }
+
+        /* If B2 is held, allow shutdown request while we are about to sleep. */
+        B2_Hold_Service_Blocking();
+
         /* Arm STOP2 wake tracking and clear any stale EXTI flags (prevents immediate wake). */
         s_stop2_armed = 1u;
         s_stop2_woke_by_b1 = 0u;
@@ -1242,7 +1282,11 @@ static void EnterStop(void)
         SystemClock_Config();
 
         s_stop2_armed = 0u;
-        if (s_stop2_woke_by_b1)
+        uint8_t woke_by_b1 = s_stop2_woke_by_b1;
+        if (!woke_by_b1 && (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == B1_ACTIVE_STATE))
+            woke_by_b1 = 1u;
+
+        if (woke_by_b1)
         {
             s_stop2_woke_by_b1 = 0u;
             if (B1_WaitHeld(B1_WAKE_HOLD_MS))
@@ -1255,9 +1299,38 @@ static void EnterStop(void)
             continue;
         }
 
+        /* If woke due to B2, wait for 2s hold and then shutdown. */
+        B2_Hold_Service_Blocking();
+
         /* Wake by something else: return to caller. (USB attach will reset anyway.) */
         return;
     }
+}
+
+static void EnterShutdown(void)
+{
+    /* Force-stop any program and blank LEDs before powering down. */
+    mp_force_stop();
+    Power_MinimizeLoads();
+
+    /* On battery, also disable charger enable. */
+    HAL_GPIO_WritePin(CTL_CEN_GPIO_Port, CTL_CEN_Pin, GPIO_PIN_RESET);
+
+    /* Configure wake sources: only B1 (WKUP1, PA0) wakes the MCU. */
+    HAL_SuspendTick();
+    HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN1_HIGH);
+    HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN2_HIGH);
+    HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN3_HIGH);
+    HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN4_HIGH);
+    HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN5_HIGH);
+    HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN7_HIGH);
+
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1_HIGH);
+
+    /* Enter deepest low power mode (wake causes reset). */
+    HAL_PWR_EnterSHUTDOWNMode();
+    while (1) { }
 }
 
 static volatile uint8_t s_lamp_off_req = 0u;
@@ -1377,6 +1450,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
             USB_CLI_NotifyDetach();
             /* USB disconnected: switch to battery/autorun mode. */
             mp_request_usb_detach();
+            mp_force_stop();
             /* Ensure indicator LED is not left stuck in "charger mirror" state. */
             IND_LED_Off();
             /* Do not autorun on detach: go to STOP2 and wait for B1 hold. */

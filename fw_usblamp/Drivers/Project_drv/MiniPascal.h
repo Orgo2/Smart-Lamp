@@ -110,9 +110,11 @@ void mp_poll(void);
  /* Request program start from a slot (safe to call from IRQ). */
  void mp_request_run_slot(uint8_t slot);
  /* Request (re)start of the currently loaded program (safe to call from IRQ). */
- void mp_request_run_loaded(void);
+void mp_request_run_loaded(void);
  /* Notify interpreter that USB was detached (safe to call from IRQ). */
  void mp_request_usb_detach(void);
+/* Force-stop any running program immediately (used on USB attach/detach and sleep). */
+void mp_force_stop(void);
 void mp_start_session(void);
 void mp_stop_session(void);
 void mp_feed_char(char c);

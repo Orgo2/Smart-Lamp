@@ -10,6 +10,14 @@
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_tim2_ch1;
 
+static volatile uint8_t s_led_dma_done = 1u;
+
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim != &htim2) return;
+    s_led_dma_done = 1u;
+}
+
 /*
  * Timing: TIM2 @ 48 MHz, ARR=59 => 60 ticks => 1.25 us (800 kHz).
  * Duty (CCR1): 0-bit high ~0.29 us => 14, 1-bit high ~0.75 us => 36.
@@ -79,6 +87,7 @@ void led_render(void)
 
     /* Stop any previous transfer. */
     HAL_TIM_PWM_Stop_DMA(&htim2, TIM_CHANNEL_1);
+    s_led_dma_done = 1u;
 
     /* Encode pixels (GRBW, MSB first). */
     for (uint32_t i = 0; i < numberofpixels; i++)
@@ -99,5 +108,19 @@ void led_render(void)
         pwm_buffer[p++] = 0u;
 
     /* Start the new transfer. */
-    HAL_TIM_PWM_Start_DMA(&htim2, TIM_CHANNEL_1, pwm_buffer, p);
+    s_led_dma_done = 0u;
+    if (HAL_TIM_PWM_Start_DMA(&htim2, TIM_CHANNEL_1, pwm_buffer, p) != HAL_OK)
+    {
+        s_led_dma_done = 1u;
+        return;
+    }
+
+    /* Wait for DMA transfer to complete before any deep sleep can occur. */
+    uint32_t t0 = HAL_GetTick();
+    while (!s_led_dma_done && ((uint32_t)(HAL_GetTick() - t0) < 10u))
+        __WFI();
+
+    /* Stop PWM+DMA after transfer (or timeout). */
+    (void)HAL_TIM_PWM_Stop_DMA(&htim2, TIM_CHANNEL_1);
+    s_led_dma_done = 1u;
 }

@@ -556,8 +556,10 @@ static void handle_line(char *line)
         MemMon_Get(&total, &free, &min_free, &min_tick_ms, min_dt, sizeof(min_dt));
         cdc_writef("RAM: total=%luB free=%luB minfree=%luB\r\n",
                    (unsigned long)total, (unsigned long)free, (unsigned long)min_free);
-        cdc_writef("RAM: minfree_at=%s uptime_ms=%lu\r\n",
-                   min_dt[0] ? min_dt : "N/A", (unsigned long)min_tick_ms);
+        cdc_writef("RAM: uptime_ms=%lu minfree_at=%s minfree_uptime_ms=%lu\r\n",
+                   (unsigned long)HAL_GetTick(),
+                   min_dt[0] ? min_dt : "N/A",
+                   (unsigned long)min_tick_ms);
         return;
     }
 
