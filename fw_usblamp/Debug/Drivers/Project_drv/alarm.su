@@ -4,3 +4,4 @@
 ../Drivers/Project_drv/alarm.c:116:6:HAL_LPTIM_AutoReloadMatchCallback	16	static
 ../Drivers/Project_drv/alarm.c:132:6:BEEP	24	static,ignoring_inline_asm
 ../Drivers/Project_drv/alarm.c:147:6:BEEP_Task	8	static
+../Drivers/Project_drv/alarm.c:156:9:BEEP_IsActive	8	static

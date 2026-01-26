@@ -65,6 +65,25 @@ HAL_StatusTypeDef RTC_ReadClock(char *datetime_str)
     return HAL_OK;
 }
 
+HAL_StatusTypeDef RTC_GetYMDHMS(int *yy, int *mo, int *dd, int *hh, int *mm, int *ss)
+{
+    if (!yy || !mo || !dd || !hh || !mm || !ss) return HAL_ERROR;
+
+    char dt[RTC_DATETIME_STRING_SIZE];
+    if (RTC_ReadClock(dt) != HAL_OK) return HAL_ERROR;
+
+    int t_h=0,t_m=0,t_s=0,t_y=0,t_mo=0,t_d=0;
+    if (sscanf(dt, "%02d:%02d:%02d_%02d.%02d.%02d", &t_h,&t_m,&t_s,&t_y,&t_mo,&t_d) != 6) return HAL_ERROR;
+
+    *yy = t_y;
+    *mo = t_mo;
+    *dd = t_d;
+    *hh = t_h;
+    *mm = t_m;
+    *ss = t_s;
+    return HAL_OK;
+}
+
 HAL_StatusTypeDef RTC_SetClock(const char *datetime_str)
 {
     RTC_TimeTypeDef sTime = {0};
@@ -114,6 +133,22 @@ HAL_StatusTypeDef RTC_SetClock(const char *datetime_str)
     }
     
     return HAL_OK;
+}
+
+void RTC_WriteTimeYMDHM(rtc_write_fn_t write)
+{
+    if (!write) return;
+
+    int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
+    if (RTC_GetYMDHMS(&yy, &mo, &dd, &hh, &mm, &ss) != HAL_OK)
+    {
+        write("ERR time\r\n");
+        return;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d,%02d,%02d,%02d,%02d\r\n", yy, mo, dd, hh, mm);
+    write(buf);
 }
 
 HAL_StatusTypeDef RTC_SetAlarm(const char *alarm_str, uint8_t duration_sec, uint8_t callback_interval_sec)

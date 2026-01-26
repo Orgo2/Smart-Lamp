@@ -152,3 +152,8 @@ void BEEP_Task(void)
     s_alarm_pending = 0u;
     alarm_start_it(s_alarm_req_freq_hz, s_alarm_req_volume, s_alarm_req_time_s);
 }
+
+uint8_t BEEP_IsActive(void)
+{
+    return s_alarm_active ? 1u : 0u;
+}

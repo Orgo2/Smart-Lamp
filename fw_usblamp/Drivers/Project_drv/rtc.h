@@ -21,6 +21,9 @@ HAL_StatusTypeDef RTC_Init(void);
 /* Read current date/time into datetime_str (see RTC_DATETIME_STRING_SIZE). */
 HAL_StatusTypeDef RTC_ReadClock(char *datetime_str);
 
+/* Read RTC date/time into separate fields (YY,MO,DD,HH,MM,SS). */
+HAL_StatusTypeDef RTC_GetYMDHMS(int *yy, int *mo, int *dd, int *hh, int *mm, int *ss);
+
 /* Set RTC date/time from a formatted string (see RTC_DATETIME_STRING_SIZE). */
 HAL_StatusTypeDef RTC_SetClock(const char *datetime_str);
 
@@ -33,5 +36,9 @@ HAL_StatusTypeDef RTC_GetDailyAlarm(uint8_t *hh, uint8_t *mm, uint8_t *duration_
 
 /* Alarm active flag (1 when alarm beeping/running, 0 otherwise) */
 extern volatile uint8_t RTC_AlarmTrigger;
+
+/* USB CLI helper: TIME() -> "YY,MO,DD,HH,MM" */
+typedef void (*rtc_write_fn_t)(const char *s);
+void RTC_WriteTimeYMDHM(rtc_write_fn_t write);
 
 #endif /* PROJECT_DRV_RTC_H_ */

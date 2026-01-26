@@ -10,6 +10,14 @@
 
 #define BME280_I2C_ADDR  0x76  /* CSB pin connected to GND */
 
+/* Measurement/init timeouts (ms). */
+#ifndef BME280_TIMEOUT_MS
+#define BME280_TIMEOUT_MS       5000u
+#endif
+#ifndef BME280_I2C_TIMEOUT_MS
+#define BME280_I2C_TIMEOUT_MS   500u   /* I2C operation timeout */
+#endif
+
 typedef struct {
     float temperature;
     float pressure;

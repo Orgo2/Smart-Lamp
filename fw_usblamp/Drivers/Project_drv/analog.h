@@ -11,6 +11,11 @@
 #define ANALOG_VREF             3.3f        /* Reference voltage (nominal). */
 #define ANALOG_ADC_MAX_VALUE    4095.0f     /* 12-bit without oversampling. */
 
+/* VREFINT oversampling for VDDA estimation. */
+#ifndef ANALOG_VREF_SAMPLES
+#define ANALOG_VREF_SAMPLES     4U
+#endif
+
 /* Light sensor (TIA with SFH203P photodiode) configuration */
 #define ANALOG_TIA_RESISTOR     330000.0f       /* 330k ohm TIA feedback resistor. */
 #define ANALOG_LIGHT_CHANNEL    ADC_CHANNEL_14  /* PA7 - AN_LI */

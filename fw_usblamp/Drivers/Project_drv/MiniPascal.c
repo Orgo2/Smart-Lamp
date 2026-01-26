@@ -93,22 +93,6 @@ static void mp_utoa_hex(uint32_t v, char *out){
   out[i]=0;
 }
 
-static const char* mic_err_name(mic_err_t e){
-  switch (e){
-    case MIC_ERR_OK: return "OK";
-    case MIC_ERR_NOT_INIT: return "NOT_INIT";
-    case MIC_ERR_SPI_NOT_READY: return "SPI_NOT_READY";
-    case MIC_ERR_START_DMA: return "START_DMA";
-    case MIC_ERR_TIMEOUT: return "TIMEOUT";
-    case MIC_ERR_SPI_ERROR: return "SPI_ERROR";
-    case MIC_ERR_DMA_NO_WRITE: return "DMA_NO_WRITE";
-    case MIC_ERR_DATA_STUCK: return "DATA_STUCK";
-    case MIC_ERR_SIGNAL_SATURATED: return "SIGNAL_SATURATED";
-    case MIC_ERR_NO_DATA_YET: return "NO_DATA_YET";
-    default: return "UNKNOWN";
-  }
-}
-
 static bool parse_int(const char **p, int *out){
   while (**p==' '||**p=='\t') (*p)++;
   if (!isdigit((unsigned char)**p) && **p!='-') return false;
@@ -268,9 +252,10 @@ enum {
   SV_LEDI  = 10, SV_LEDR, SV_LEDG, SV_LEDB, SV_LEDW,             /* 10..14 */
   SV_TIMEH = 15, SV_TIMEM, SV_TIMES,                             /* 15..17 */
   SV_ALH   = 18, SV_ALM, SV_ALS,                                 /* 18..20 */
-  SV_TIMEY = 21, SV_TIMEMO, SV_TIMED                             /* 21..23 */
+  SV_TIMEY = 21, SV_TIMEMO, SV_TIMED,                            /* 21..23 */
+  SV_MICLF = 24, SV_MICMF, SV_MICHF                              /* 24..26 (dBFS*100) */
 };
-#define SYSVAR_COUNT 24
+#define SYSVAR_COUNT 27
 
 static const sysvar_t g_sysvars[] = {
   {"CMDID", SV_CMDID}, {"NARG", SV_NARG},
@@ -280,6 +265,7 @@ static const sysvar_t g_sysvars[] = {
   {"TIMEH", SV_TIMEH}, {"TIMEM", SV_TIMEM}, {"TIMES", SV_TIMES},
   {"ALH", SV_ALH}, {"ALM", SV_ALM}, {"ALS", SV_ALS},
   {"TIMEY", SV_TIMEY}, {"TIMEMO", SV_TIMEMO}, {"TIMED", SV_TIMED},
+  {"MICLF", SV_MICLF}, {"MICMF", SV_MICMF}, {"MICHF", SV_MICHF},
 };
 
 static int sysvar_find(const char *name){
@@ -340,16 +326,30 @@ static void lex_init_prog(lex_t *lx, const char *s, const uint16_t *line_nos, ui
 }
 
 static void lex_skip_ws(lex_t *lx){
-  while (lx->s[lx->pos] && (lx->s[lx->pos]==' ' || lx->s[lx->pos]=='\t' || lx->s[lx->pos]=='\r' || lx->s[lx->pos]=='\n')){
-    if (lx->s[lx->pos]=='\n'){
-      if (lx->line_nos && lx->line_count && (uint8_t)(lx->line_idx + 1) < lx->line_count){
-        lx->line_idx++;
-        lx->line_no = lx->line_nos[lx->line_idx];
-      } else if (!lx->line_nos){
-        lx->line_no++;
-      }
+  for (;;)
+  {
+    /* C-style line comment: // ... (ignored until end-of-line). */
+    if (lx->s[lx->pos] == '/' && lx->s[lx->pos + 1] == '/')
+    {
+      while (lx->s[lx->pos] && lx->s[lx->pos] != '\n' && lx->s[lx->pos] != '\r') lx->pos++;
+      continue;
     }
-    lx->pos++;
+
+    char c = lx->s[lx->pos];
+    if (!c) return;
+    if (!(c == ' ' || c == '\t' || c == '\r' || c == '\n')) return;
+
+    while (lx->s[lx->pos] && (lx->s[lx->pos]==' ' || lx->s[lx->pos]=='\t' || lx->s[lx->pos]=='\r' || lx->s[lx->pos]=='\n')){
+      if (lx->s[lx->pos]=='\n'){
+        if (lx->line_nos && lx->line_count && (uint8_t)(lx->line_idx + 1) < lx->line_count){
+          lx->line_idx++;
+          lx->line_no = lx->line_nos[lx->line_idx];
+        } else if (!lx->line_nos){
+          lx->line_no++;
+        }
+      }
+      lx->pos++;
+    }
   }
 }
 
@@ -564,6 +564,7 @@ static int builtin_id(const char *name){
 
   /* Microphone processing (Drivers/Project_drv/mic.*). */
   if (!mp_stricmp(name,"mic"))   return 9;
+  if (!mp_stricmp(name,"micfft")) return 19;
 
   /* RTC clock/alarm (Drivers/Project_drv/rtc.*). */
   if (!mp_stricmp(name,"time")) return 10;      /* time() or time(sel) */
@@ -1450,9 +1451,10 @@ static void help(void){
   mp_puts("MiniPascal monitor\r\n");
   mp_puts("\r\n");
   mp_puts("=== COMMANDS ===\r\n");
-  mp_puts("  EDIT         edit new program\r\n");
+  mp_puts("  EDIT         edit current buffer\r\n");
   mp_puts("  EDIT 1       edit program from slot 1 (1-3)\r\n");
   mp_puts("  NEW          clear program\r\n");
+  mp_puts("  CLR          clear program (alias of NEW)\r\n");
   mp_puts("  LIST         show program\r\n");
   mp_puts("  RUN          compile and run\r\n");
   mp_puts("  STOP         stop running\r\n");
@@ -1470,7 +1472,8 @@ static void help(void){
   mp_puts("  LED(idx,r,g,b,w)    set LED color (idx 1-12)\r\n");
   mp_puts("  LEDON(r,g,b,w)      set all LEDs on\r\n");
   mp_puts("  LEDOFF()            turn all LEDs off\r\n");
-  mp_puts("  DELAY(ms)           delay milliseconds (battery: >=20ms uses low power mode)\r\n");
+  mp_puts("  // comment          ignore rest of line\r\n");
+  mp_puts("  DELAY(ms)           delay milliseconds (battery: low power sleep)\r\n");
   mp_puts("  BEEP(freq,vol,ms)   beep tone (vol 0-50)\r\n");
   mp_puts("  GOTO n              jump to line n\r\n");
   mp_puts("  TIME()              read RTC into TIMEY/TIMEMO/TIMED/TIMEH/TIMEM/TIMES\r\n");
@@ -1490,6 +1493,8 @@ static void help(void){
   mp_puts("  PRESS()      pressure (x100)\r\n");
   mp_puts("  BTN()        next short-press event (0=none, 1=B1, 2=B2, 3=BL)\r\n");
   mp_puts("  MIC()        microphone level\r\n");
+  mp_puts("  MICFFT()     3-band mic bins -> MICLF/MICMF/MICHF (dBFS*100)\r\n");
+  mp_puts("              LF=100-400Hz MF=400-1600Hz HF=1600-4000Hz (avg window ~250ms)\r\n");
   mp_puts("\r\n");
   mp_puts("=== FLOW CONTROL ===\r\n");
   mp_puts("  10 x:=1\r\n");
@@ -1746,6 +1751,38 @@ static void edit_enter_new(void)
   edit_render();
 }
 
+static void edit_enter_resume(void)
+{
+  g_edit_state = (mp_edit_t){0};
+
+  if (g_ed.count == 0)
+  {
+    edit_enter_new();
+    return;
+  }
+
+  /* Add a trailing empty line for easy appending. */
+  if (g_ed.count < MP_MAX_LINES)
+  {
+    uint8_t last = (uint8_t)(g_ed.count - 1u);
+    if (g_ed.lines[last].text[0] != 0)
+    {
+      g_ed.lines[g_ed.count].line_no = g_ed.lines[last].line_no + g_step;
+      g_ed.lines[g_ed.count].text[0] = 0;
+      g_ed.count++;
+      g_edit_state.added_tail = 1u;
+    }
+  }
+
+  g_edit = true;
+  /* Keep g_edit_slot as-is (resume same buffer/slot). */
+  g_edit_state.active = 1u;
+  g_edit_state.line_idx = 0u;
+  g_edit_state.cur = 0u;
+  edit_load_from_ed(0u);
+  edit_render();
+}
+
 static bool edit_enter_slot(uint8_t slot)
 {
   g_edit_state = (mp_edit_t){0};
@@ -1883,6 +1920,8 @@ static void edit_enter_key(void)
     *e = 0;
     if (mp_stricmp(p, "QUIT") == 0)
     {
+      /* Discard the QUIT line itself (do not store it into the program). */
+      edit_load_from_ed(g_edit_state.line_idx);
       edit_exit();
       return;
     }
@@ -2017,6 +2056,7 @@ static void handle_line(char *line){
 
   if (!mp_stricmp(cmd,"HELP")) { help(); return; }
   if (!mp_stricmp(cmd,"NEW"))  { ed_init(&g_ed); mp_puts("OK\r\n"); return; }
+  if (!mp_stricmp(cmd,"CLR"))  { ed_init(&g_ed); g_have_prog=false; g_vm.running=false; mp_puts("OK\r\n"); return; }
   if (!mp_stricmp(cmd,"LIST")) { ed_list(&g_ed); return; }
   if (!mp_stricmp(cmd,"DEL"))  { int ln=0; const char *p=args; if(parse_int(&p,&ln) && ed_delete(&g_ed,ln)) mp_puts("OK\r\n"); else mp_puts("Not found\r\n"); return; }
   if (!mp_stricmp(cmd,"RUN"))  { cmd_run(); return; }
@@ -2089,7 +2129,8 @@ static void handle_line(char *line){
       (void)edit_enter_slot(s);
       return;
     }
-    edit_enter_new();
+    /* Resume current editor buffer; use NEW/CLR to start from empty. */
+    edit_enter_resume();
     return;
   }
 
@@ -2136,7 +2177,7 @@ static void handle_line(char *line){
 static void mp_indicate_program_start(void){
   if (mp_hal_usb_connected()) return;
   IND_LED_On();
-  LP_DELAY(200);
+  LP_DELAY(100);
   IND_LED_Off();
 }
 
@@ -2327,6 +2368,17 @@ void mp_poll(void){
           if (g_have_prog) { vm_reset(&g_vm); mp_indicate_program_start(); }
         }
       }
+      else
+      {
+        /* No other program to switch to (battery mode). Indicate 3x (100ms pulses). */
+        for (uint8_t i = 0; i < 3; i++)
+        {
+          IND_LED_On();
+          LP_DELAY(100);
+          IND_LED_Off();
+          LP_DELAY(100);
+        }
+      }
     }
   }
 
@@ -2458,13 +2510,7 @@ void mp_notify_button_long(uint8_t btn_id)
 }
 
 static bool time_read_ymdhms(int *yy, int *mo, int *dd, int *hh, int *mm, int *ss){
-  if (!yy || !mo || !dd || !hh || !mm || !ss) return false;
-  char dt[RTC_DATETIME_STRING_SIZE];
-  if (RTC_ReadClock(dt) != HAL_OK) return false;
-  int t_h=0,t_m=0,t_s=0,t_y=0,t_mo=0,t_d=0;
-  if (sscanf(dt, "%02d:%02d:%02d_%02d.%02d.%02d", &t_h,&t_m,&t_s,&t_y,&t_mo,&t_d) != 6) return false;
-  *yy = t_y; *mo = t_mo; *dd = t_d; *hh = t_h; *mm = t_m; *ss = t_s;
-  return true;
+  return (RTC_GetYMDHMS(yy, mo, dd, hh, mm, ss) == HAL_OK);
 }
 
 static void time_update_vars(int32_t *vars){
@@ -2598,52 +2644,46 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
       {
         const int32_t fault = -99900;
 
-        mic_err_t start = MIC_Start();
-        if (start == MIC_ERR_NOT_INIT){
-          MIC_Init();
-          start = MIC_Start();
-        }
-
-        if (start != MIC_ERR_OK){
+        int16_t dbfs_x100 = 0;
+        mic_err_t st = MIC_ReadDbfsX100_Blocking(250u, &dbfs_x100);
+        if (st != MIC_ERR_OK){
           if (mp_hal_usb_connected()){
             char b[160];
             const char *msg = MIC_LastErrorMsg();
-            snprintf(b, sizeof(b), "[mic] start=%s(%ld) msg=%s\r\n",
-                     mic_err_name(start), (long)start, msg ? msg : "");
+            snprintf(b, sizeof(b), "[mic] st=%s(%ld) msg=%s\r\n",
+                     MIC_ErrName(st), (long)st, msg ? msg : "");
             mp_puts(b);
           }
           return fault;
         }
 
-        float dbfs = 0.0f;
-        float rms  = 0.0f;
-        mic_err_t st = MIC_GetLast50ms(&dbfs, &rms);
+        return (int32_t)dbfs_x100;
+      }
 
-        uint32_t t0 = HAL_GetTick();
-        while ((st == MIC_ERR_NO_DATA_YET) && ((HAL_GetTick() - t0) < 250u)){
-          MIC_Task();
-          HAL_Delay(1);
-          st = MIC_GetLast50ms(&dbfs, &rms);
-        }
-
+    case 19: /* micfft() -> updates MICLF/MICMF/MICHF (dBFS*100). Returns 0 or negative mic_err_t. */
+      if (argc==0){
+        int16_t lf=0, mf=0, hf=0;
+        mic_err_t st = MIC_FFT_WaitBinsDbX100(1000u, &lf, &mf, &hf);
         if (st != MIC_ERR_OK){
           if (mp_hal_usb_connected()){
-            char b[220];
+            char b[160];
             const char *msg = MIC_LastErrorMsg();
-            int32_t last_dbfs_x100 = (int32_t)(MIC_LastDbFS() * 100.0f);
-            uint32_t last_rms_u1e6 = (uint32_t)(MIC_LastRms() * 1000000.0f);
-            snprintf(b, sizeof(b),
-                     "[mic] st=%s(%ld) last_dbfs_x100=%ld last_rms_u1e6=%lu msg=%s\r\n",
-                     mic_err_name(st), (long)st,
-                     (long)last_dbfs_x100, (unsigned long)last_rms_u1e6,
-                     msg ? msg : "");
+            snprintf(b, sizeof(b), "[micfft] st=%s(%ld) msg=%s\r\n",
+                     MIC_ErrName(st), (long)st, msg ? msg : "");
             mp_puts(b);
           }
-          return fault;
+          g_vm.vars[SV_MICLF] = 0;
+          g_vm.vars[SV_MICMF] = 0;
+          g_vm.vars[SV_MICHF] = 0;
+          return (int32_t)st;
         }
 
-        return (int32_t)(dbfs * 100.0f);
+        g_vm.vars[SV_MICLF] = (int32_t)lf;
+        g_vm.vars[SV_MICMF] = (int32_t)mf;
+        g_vm.vars[SV_MICHF] = (int32_t)hf;
+        return 0;
       }
+      return -1;
 
     /* ---------------- RTC clock + alarm ---------------- */
     case 10: /* time() or time(sel) */

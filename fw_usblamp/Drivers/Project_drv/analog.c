@@ -20,10 +20,6 @@ static float s_vdda_actual = ANALOG_VREF;
  *  - This driver forces CHSELR to exactly one channel before each conversion.
  *  - Only single-shot conversions are used (no DMA, no continuous mode).
  */
-#ifndef ANALOG_VREF_SAMPLES
-#define ANALOG_VREF_SAMPLES 4U
-#endif
-
 /* Cached results */
 static volatile uint32_t s_raw_vrefint;
 static volatile uint32_t s_raw_bat;

@@ -12,7 +12,7 @@
  * Higher values allow bigger programs but use more RAM.
  */
 #ifndef MP_MAX_LINES
-#define MP_MAX_LINES        50      /* stored program lines */
+#define MP_MAX_LINES        70      /* stored program lines */
 #endif
 
 #ifndef MP_LINE_LEN
@@ -32,7 +32,7 @@
 #endif
 
 #ifndef MP_BC_MAX
-#define MP_BC_MAX           1536    /* Bytecode buffer; lower saves RAM. */
+#define MP_BC_MAX           2048    /* Bytecode buffer; lower saves RAM. */
 #endif
 
 #ifndef MP_STACK_SIZE

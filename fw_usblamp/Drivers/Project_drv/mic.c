@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
 
@@ -16,28 +17,32 @@
 extern SPI_HandleTypeDef hspi1;
 
 /* DSP config: decimation + 50 ms windows for RMS/dBFS measurement. */
-#ifndef MIC_DECIM_N
-#define MIC_DECIM_N  8u
-#endif
-
-/* RMS/dBFS integration window length. */
-#define MIC_WINDOW_MS         50u
-
-/* Samples per window at the expected post-decimation sample rate (approx). */
-#define MIC_WINDOW_SAMPLES    313u
-
-/* DMA strategy: repeated short RX transfers (start -> wait -> process -> restart). */
-#define MIC_DMA_WORDS         512u
-#define MIC_TIMEOUT_MS        200u
+/* DMA strategy:
+ *  - Normal DMA: start -> wait -> process -> restart (small gaps between blocks).
+ *  - Circular DMA (CubeMX): continuous clock, process half/full buffers without restart.
+ */
 
 /* DMA RX buffer for one block. */
 static uint16_t s_rx_buf[MIC_DMA_WORDS];
 
 /* DMA transfer state. */
 static volatile uint8_t s_spi_done;
+static volatile uint8_t s_spi_half;
 static volatile uint8_t s_spi_err;
 static uint32_t s_dma_t0_ms;
+static uint32_t s_dma_last_evt_ms;
+static uint8_t  s_dma_circular;
 static uint32_t s_capture_t0_ms;
+
+/* Diagnostics (no-scope). */
+static volatile uint32_t s_cb_half_count;
+static volatile uint32_t s_cb_full_count;
+static volatile uint32_t s_cb_err_count;
+static volatile uint32_t s_cb_half_last_ms;
+static volatile uint32_t s_cb_full_last_ms;
+static volatile uint32_t s_cb_err_last_ms;
+static uint32_t s_cb_start_ms;
+static uint32_t s_cb_full_start_count;
 
 /* Driver state. */
 static uint8_t s_inited;
@@ -55,24 +60,72 @@ static uint32_t s_win_count;      /* number of PCM samples collected */
 static double   s_win_sum_sq;     /* sum(sample^2) for RMS */
 static double   s_win_peak;       /* peak amplitude (debug) */
 static uint32_t s_decim_phase;    /* decimation phase counter */
+static uint32_t s_pcm_fs_hz;      /* estimated PCM sample rate after decimation */
+static uint32_t s_win_target_samples;
+
+/* =====================================================================================
+ * MICFFT (3-band "FFT-like" analysis state)
+ * ===================================================================================== */
+
+static uint32_t s_fft_fs_hz;
+static float    s_fft_a_hp;    /* low-pass alpha for MICFFT_HP_HZ (used to form high-pass by subtraction) */
+static float    s_fft_a_lf;    /* low-pass alpha for MICFFT_LF_MAX_HZ */
+static float    s_fft_a_mf;    /* low-pass alpha for MICFFT_MF_MAX_HZ */
+static float    s_fft_a_hf;    /* low-pass alpha for MICFFT_HF_MAX_HZ (band-limit) */
+
+static float    s_fft_lp_hp;
+static float    s_fft_lp_lf;
+static float    s_fft_lp_mf;
+static float    s_fft_lp_hf;
+
+static uint32_t s_fft_t0_ms;
+static uint32_t s_fft_n;
+static double   s_fft_sum_sq_lf;
+static double   s_fft_sum_sq_mf;
+static double   s_fft_sum_sq_hf;
+
+static uint8_t  s_fft_have_bins;
+static mic_err_t s_fft_last_err;
+static int16_t  s_fft_last_lf_db_x100;
+static int16_t  s_fft_last_mf_db_x100;
+static int16_t  s_fft_last_hf_db_x100;
 
 /* Compile-time power-save settings (MIC_POWERSAVE in mic.h). */
 static inline uint32_t mic_get_target_ms(void)
 {
     /* 0 = continuous */
     if (MIC_POWERSAVE == 0u) return 0u;
-    /* 1..10 = minimum 10ms */
-    uint32_t target = (MIC_POWERSAVE <= 10u) ? 10u : (uint32_t)MIC_POWERSAVE;
 
-    /* Ensure at least wake-up + one 50ms window worth of time. */
-    uint32_t min_target = (uint32_t)MIC_WAKEUP_MS + (uint32_t)MIC_WINDOW_MS;
-    if (target < min_target) target = min_target;
-    return target;
+    /*
+     * MIC_POWERSAVE is the requested "useful" capture time.
+     * If the clock was OFF before start, add MIC_WAKEUP_MS on top.
+     */
+    uint32_t measure_ms = (uint32_t)MIC_POWERSAVE;
+
+    /* Ensure we can produce at least one RMS window after warm-up. */
+    if (measure_ms < (uint32_t)MIC_WINDOW_MS)
+        measure_ms = (uint32_t)MIC_WINDOW_MS;
+
+    uint32_t total_ms = measure_ms + (uint32_t)MIC_WAKEUP_MS;
+    if (total_ms < measure_ms)
+        total_ms = 0xFFFFFFFFu; /* saturate on overflow (defensive) */
+    return total_ms;
 }
 
 /* last DMA snapshot for CLI dump */
 static uint8_t  s_have_last_dma;
 static uint32_t s_last_dma_words;
+
+/* last RX quality snapshot (for diagnostics) */
+static uint32_t s_last_rx_ms;
+static uint32_t s_last_rx_words;
+static uint32_t s_last_rx_cnt_0000;
+static uint32_t s_last_rx_cnt_ffff;
+static uint32_t s_last_rx_transitions;
+static uint16_t s_last_rx_minw;
+static uint16_t s_last_rx_maxw;
+static uint16_t s_last_rx_first[8];
+static uint32_t s_last_rx_first_n;
 
 const uint16_t* MIC_DebugLastDmaBuf(uint32_t *out_words)
 {
@@ -103,6 +156,199 @@ static void set_error(mic_err_t e, const char *msg)
         printf("[MIC] %s\r\n", msg);
 }
 
+static uint32_t mic_pcm_fs_hz(void);
+
+static void mic_update_rates(void)
+{
+    s_pcm_fs_hz = mic_pcm_fs_hz();
+
+    if (s_pcm_fs_hz == 0u)
+    {
+        /* Fallback to the previous fixed assumption (~6 kHz). */
+        s_win_target_samples = 313u;
+        return;
+    }
+
+    uint32_t target = (s_pcm_fs_hz * (uint32_t)MIC_WINDOW_MS + 500u) / 1000u;
+    if (target == 0u) target = 1u;
+    s_win_target_samples = target;
+}
+
+static uint32_t mic_spi_prescaler_div(uint32_t prescaler)
+{
+    switch (prescaler)
+    {
+        case SPI_BAUDRATEPRESCALER_2:   return 2u;
+        case SPI_BAUDRATEPRESCALER_4:   return 4u;
+        case SPI_BAUDRATEPRESCALER_8:   return 8u;
+        case SPI_BAUDRATEPRESCALER_16:  return 16u;
+        case SPI_BAUDRATEPRESCALER_32:  return 32u;
+        case SPI_BAUDRATEPRESCALER_64:  return 64u;
+        case SPI_BAUDRATEPRESCALER_128: return 128u;
+        case SPI_BAUDRATEPRESCALER_256: return 256u;
+        default:                        return 2u;
+    }
+}
+
+static uint32_t mic_spi_bits_per_word(void)
+{
+    /* CubeMX config uses 16-bit. Keep fallback defensive. */
+    if (hspi1.Init.DataSize == SPI_DATASIZE_16BIT) return 16u;
+    if (hspi1.Init.DataSize == SPI_DATASIZE_8BIT)  return 8u;
+    return 16u;
+}
+
+static uint32_t mic_pcm_fs_hz(void)
+{
+    /*
+     * We treat each received SPI word as one CIC input sample (it represents 16 PDM bits via popcount).
+     * Therefore the CIC input sample rate is: fs_in = SPI_SCK / bits_per_word.
+     * After MIC_DECIM_N, PCM fs is: fs = fs_in / MIC_DECIM_N.
+     */
+    uint32_t pclk = HAL_RCC_GetPCLK1Freq();
+    if (pclk == 0u) pclk = HAL_RCC_GetHCLKFreq();
+    if (pclk == 0u) return 0u;
+
+    uint32_t div  = mic_spi_prescaler_div(hspi1.Init.BaudRatePrescaler);
+    uint32_t sck  = pclk / div;
+    uint32_t bits = mic_spi_bits_per_word();
+    if (bits == 0u) return 0u;
+
+    uint32_t fs_in = sck / bits;
+    if (MIC_DECIM_N == 0u) return 0u;
+    return fs_in / MIC_DECIM_N;
+}
+
+static float mic_lp_alpha_from_fc(uint32_t fc_hz, uint32_t fs_hz)
+{
+    if (fs_hz == 0u || fc_hz == 0u) return 0.0f;
+
+    float fs = (float)fs_hz;
+    float fc = (float)fc_hz;
+
+    /* Clamp for stability if configuration/sample-rate makes fc too high. */
+    float fc_max = 0.45f * fs;
+    if (fc > fc_max) fc = fc_max;
+    if (fc < 1.0f) fc = 1.0f;
+
+    /* alpha = 2*pi*fc / (2*pi*fc + fs) */
+    const float two_pi = 6.28318530718f;
+    float w = two_pi * fc;
+    float a = w / (w + fs);
+    if (a < 0.0f) a = 0.0f;
+    if (a > 1.0f) a = 1.0f;
+    return a;
+}
+
+static inline float mic_lp_step(float x, float *state, float alpha)
+{
+    *state += alpha * (x - *state);
+    return *state;
+}
+
+static int16_t mic_dbfs_to_x100_i16(float dbfs)
+{
+    /* Round to centi-dB and clamp to int16. */
+    float x = dbfs * 100.0f;
+    int32_t v = (x >= 0.0f) ? (int32_t)(x + 0.5f) : (int32_t)(x - 0.5f);
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return (int16_t)v;
+}
+
+static void micfft_invalidate(mic_err_t e)
+{
+    s_fft_have_bins = 0u;
+    s_fft_last_err = e;
+    s_fft_t0_ms = 0u;
+    s_fft_n = 0u;
+    s_fft_sum_sq_lf = 0.0;
+    s_fft_sum_sq_mf = 0.0;
+    s_fft_sum_sq_hf = 0.0;
+}
+
+static void micfft_reset(void)
+{
+    s_fft_fs_hz = mic_pcm_fs_hz();
+    s_fft_a_hp = mic_lp_alpha_from_fc(MICFFT_HP_HZ, s_fft_fs_hz);
+    s_fft_a_lf = mic_lp_alpha_from_fc(MICFFT_LF_MAX_HZ, s_fft_fs_hz);
+    s_fft_a_mf = mic_lp_alpha_from_fc(MICFFT_MF_MAX_HZ, s_fft_fs_hz);
+    s_fft_a_hf = mic_lp_alpha_from_fc(MICFFT_HF_MAX_HZ, s_fft_fs_hz);
+
+    s_fft_lp_hp = 0.0f;
+    s_fft_lp_lf = 0.0f;
+    s_fft_lp_mf = 0.0f;
+    s_fft_lp_hf = 0.0f;
+
+    s_fft_last_lf_db_x100 = -12000;
+    s_fft_last_mf_db_x100 = -12000;
+    s_fft_last_hf_db_x100 = -12000;
+
+    micfft_invalidate(MIC_ERR_NO_DATA_YET);
+}
+
+static void micfft_feed_sample(float x)
+{
+    if (MICFFT_WINDOW_MS == 0u) return;
+    if (s_fft_fs_hz == 0u) return;
+
+    /* High-pass by subtracting a low-pass at MICFFT_HP_HZ. */
+    float lp_hp = mic_lp_step(x, &s_fft_lp_hp, s_fft_a_hp);
+    float x_hp = x - lp_hp;
+
+    /* Band-limit to MICFFT_HF_MAX_HZ. */
+    float x_band = mic_lp_step(x_hp, &s_fft_lp_hf, s_fft_a_hf);
+
+    /* Two low-pass splits: LF cutoff and MF cutoff. */
+    float lp_lf = mic_lp_step(x_band, &s_fft_lp_lf, s_fft_a_lf);
+    float lp_mf = mic_lp_step(x_band, &s_fft_lp_mf, s_fft_a_mf);
+
+    float lf = lp_lf;
+    float mf = lp_mf - lp_lf;
+    float hf = x_band - lp_mf;
+
+    double dlf = (double)lf;
+    double dmf = (double)mf;
+    double dhf = (double)hf;
+
+    if (s_fft_n == 0u)
+        s_fft_t0_ms = HAL_GetTick();
+
+    s_fft_sum_sq_lf += dlf * dlf;
+    s_fft_sum_sq_mf += dmf * dmf;
+    s_fft_sum_sq_hf += dhf * dhf;
+    s_fft_n++;
+
+    uint32_t now = HAL_GetTick();
+    if ((now - s_fft_t0_ms) < (uint32_t)MICFFT_WINDOW_MS)
+        return;
+
+    if (s_fft_n == 0u)
+        return;
+
+    float rms_lf = (float)sqrt(s_fft_sum_sq_lf / (double)s_fft_n);
+    float rms_mf = (float)sqrt(s_fft_sum_sq_mf / (double)s_fft_n);
+    float rms_hf = (float)sqrt(s_fft_sum_sq_hf / (double)s_fft_n);
+
+    float db_lf = safe_dbfs_from_rms(rms_lf);
+    float db_mf = safe_dbfs_from_rms(rms_mf);
+    float db_hf = safe_dbfs_from_rms(rms_hf);
+
+    s_fft_last_lf_db_x100 = mic_dbfs_to_x100_i16(db_lf);
+    s_fft_last_mf_db_x100 = mic_dbfs_to_x100_i16(db_mf);
+    s_fft_last_hf_db_x100 = mic_dbfs_to_x100_i16(db_hf);
+
+    s_fft_have_bins = 1u;
+    s_fft_last_err = MIC_ERR_OK;
+
+    /* Reset for next window. */
+    s_fft_t0_ms = now;
+    s_fft_n = 0u;
+    s_fft_sum_sq_lf = 0.0;
+    s_fft_sum_sq_mf = 0.0;
+    s_fft_sum_sq_hf = 0.0;
+}
+
 /* PDM->PCM pipeline: CIC + decimation + short FIR smoothing (feeds RMS accumulator). */
 
 /* CIC state (single channel). */
@@ -110,7 +356,6 @@ static int32_t s_cic_integrator;
 static int32_t s_cic_comb_prev;
 
 /* FIR moving average (simple low-pass). */
-#define MIC_FIR_TAPS  8u
 static int32_t s_fir_hist[MIC_FIR_TAPS];
 static uint32_t s_fir_pos;
 
@@ -165,16 +410,37 @@ static inline float pdm2pcm_step(int32_t cic_in)
 }
 
 /* HAL callbacks (DMA completion / error). */
+void HAL_SPI_RxHalfCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi == &hspi1)
+    {
+        s_spi_half = 1u;
+        s_dma_last_evt_ms = HAL_GetTick();
+        s_cb_half_count++;
+        s_cb_half_last_ms = s_dma_last_evt_ms;
+    }
+}
+
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if (hspi == &hspi1)
+    {
         s_spi_done = 1u;
+        s_dma_last_evt_ms = HAL_GetTick();
+        s_cb_full_count++;
+        s_cb_full_last_ms = s_dma_last_evt_ms;
+    }
 }
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     if (hspi == &hspi1)
+    {
         s_spi_err = 1u;
+        s_dma_last_evt_ms = HAL_GetTick();
+        s_cb_err_count++;
+        s_cb_err_last_ms = s_dma_last_evt_ms;
+    }
 }
 
 /* Start one SPI RX DMA block (non-circular, processed in software). */
@@ -186,7 +452,9 @@ static mic_err_t start_dma_block(void)
     s_have_last_dma = 0u;
     s_last_dma_words = MIC_DMA_WORDS;
 
+    s_dma_circular = 0u;
     s_spi_done = 0u;
+    s_spi_half = 0u;
     s_spi_err  = 0u;
 
     /* Basic sanity checks before starting DMA. */
@@ -214,21 +482,43 @@ static mic_err_t start_dma_block(void)
 
     /* For debug: BUSY means SPI is actively generating CLOCK on PA5. */
     s_dma_t0_ms = HAL_GetTick();
+    s_dma_last_evt_ms = s_dma_t0_ms;
+
+    /* Detect circular DMA configuration (CubeMX). */
+    if (hspi1.hdmarx && hspi1.hdmarx->Instance)
+    {
+        if ((hspi1.hdmarx->Instance->CCR & DMA_CCR_CIRC) == DMA_CCR_CIRC)
+            s_dma_circular = 1u;
+    }
+
     MIC_DBG("[MIC] DMA started. SPI state=%d (2=BUSY => CLOCK on PA5)\r\n", (int)HAL_SPI_GetState(&hspi1));
     return MIC_ERR_OK;
 }
 
-/* Process one DMA block and update the 50 ms RMS/dBFS window. */
-static mic_err_t process_block_and_update_window(void)
+static mic_err_t process_words_and_update_window(const uint16_t *buf, uint32_t words)
 {
+    if (!buf || words == 0u)
+        return MIC_ERR_OK;
+
+    /* Quick RX quality stats (helps debug without an oscilloscope). */
+    uint32_t cnt_0000 = 0u;
+    uint32_t cnt_ffff = 0u;
+    uint32_t transitions = 0u;
+    uint16_t minw = 0xFFFFu;
+    uint16_t maxw = 0x0000u;
+    uint16_t prev = 0u;
+    uint8_t have_prev = 0u;
+    uint32_t first_n = 0u;
+
     /* Detect "DMA wrote nothing" by checking the 0xAAAA fill pattern. */
     uint32_t still_aa = 0;
-    for (uint32_t i = 0; i < MIC_DMA_WORDS; i++)
-        if (s_rx_buf[i] == 0xAAAAu) still_aa++;
+    for (uint32_t i = 0; i < words; i++)
+        if (buf[i] == 0xAAAAu) still_aa++;
 
-    if (still_aa == MIC_DMA_WORDS)
+    if (still_aa == words)
     {
         set_error(MIC_ERR_DMA_NO_WRITE, "ERROR: DMA completed but buffer unchanged (0xAAAA) -> DMA not writing");
+        micfft_invalidate(MIC_ERR_DMA_NO_WRITE);
         return MIC_ERR_DMA_NO_WRITE;
     }
 
@@ -236,35 +526,78 @@ static mic_err_t process_block_and_update_window(void)
     s_have_last_dma = 1u;
     s_last_dma_words = MIC_DMA_WORDS;
 
+    uint32_t elapsed_ms = HAL_GetTick() - s_capture_t0_ms;
+
     uint8_t in_warmup = 0u;
     if (MIC_WAKEUP_MS != 0u)
     {
-        uint32_t elapsed = HAL_GetTick() - s_capture_t0_ms;
-        if (elapsed < (uint32_t)MIC_WAKEUP_MS) in_warmup = 1u;
+        if (elapsed_ms < (uint32_t)MIC_WAKEUP_MS) in_warmup = 1u;
     }
 
     /* Quick data-quality check: detect stuck DATA (all 0x0000/0xFFFF) -> RMS ~= 1.0. */
-    uint32_t bad_count = 0u;
-
-    for (uint32_t i = 0; i < MIC_DMA_WORDS; i++)
+    for (uint32_t i = 0; i < words; i++)
     {
-        uint16_t w = s_rx_buf[i];
-        /* Count words that look stuck (all zeros/all ones). */
-        if ((w == 0x0000u) || (w == 0xFFFFu)) bad_count++;
+        uint16_t w = buf[i];
+
+        if (first_n < (uint32_t)(sizeof(s_last_rx_first) / sizeof(s_last_rx_first[0])))
+            s_last_rx_first[first_n++] = w;
+
+        if (w == 0x0000u) cnt_0000++;
+        if (w == 0xFFFFu) cnt_ffff++;
+
+        if (w < minw) minw = w;
+        if (w > maxw) maxw = w;
+
+        if (have_prev)
+        {
+            if (w != prev) transitions++;
+        }
+        else
+        {
+            have_prev = 1u;
+        }
+        prev = w;
     }
 
-    /* If all words are stuck (after warmup), abort with error. */
-    if ((!in_warmup) && (bad_count == MIC_DMA_WORDS))
+    s_last_rx_ms = HAL_GetTick();
+    s_last_rx_words = words;
+    s_last_rx_cnt_0000 = cnt_0000;
+    s_last_rx_cnt_ffff = cnt_ffff;
+    s_last_rx_transitions = transitions;
+    s_last_rx_minw = minw;
+    s_last_rx_maxw = maxw;
+    s_last_rx_first_n = first_n;
+
+    uint32_t bad_count = cnt_0000 + cnt_ffff;
+
+    /*
+     * If all words are stuck (all 0x0000/0xFFFF) after warmup:
+     * - still allow a small grace period for the mic to begin driving DATA
+     *   (some parts start slightly later than MIC_WAKEUP_MS),
+     * - then treat it as a hard wiring/clock issue.
+     */
+    if ((!in_warmup) && (bad_count == words))
     {
+        uint32_t startup_grace_ms = (uint32_t)MIC_WAKEUP_MS + (uint32_t)MIC_WINDOW_MS;
+        if (startup_grace_ms < (uint32_t)MIC_WAKEUP_MS)
+            startup_grace_ms = 0xFFFFFFFFu;
+
+        if (elapsed_ms < startup_grace_ms)
+        {
+            /* Keep waiting: do not poison the error state yet. */
+            return MIC_ERR_OK;
+        }
+
         set_error(MIC_ERR_DATA_STUCK, "ERROR: PDM DATA stuck (all 0x0000 or 0xFFFF)");
+        micfft_invalidate(MIC_ERR_DATA_STUCK);
         return MIC_ERR_DATA_STUCK;
     }
 
     /* PDM->PCM + decimation + RMS accumulator update. */
-    for (uint32_t i = 0; i < MIC_DMA_WORDS; i++)
+    for (uint32_t i = 0; i < words; i++)
     {
         /* CIC input derived from 16 PDM bits. */
-        int32_t cic_in = pdm_word_to_cic_input(s_rx_buf[i]);
+        int32_t cic_in = pdm_word_to_cic_input(buf[i]);
 
         /* Keep only every N-th sample (but always advance CIC/FIR state). */
         if ((s_decim_phase++ % MIC_DECIM_N) != 0u)
@@ -281,6 +614,8 @@ static mic_err_t process_block_and_update_window(void)
             continue;
         }
 
+        micfft_feed_sample(s);
+
         /* Accumulate RMS window. */
         double sd = (double)s;
         s_win_sum_sq += sd * sd;
@@ -291,7 +626,7 @@ static mic_err_t process_block_and_update_window(void)
         s_win_count++;
 
         /* When the window is full, finalize RMS/dBFS and store the result. */
-        if (s_win_count >= MIC_WINDOW_SAMPLES)
+        if (s_win_count >= s_win_target_samples)
         {
             float rms = (float)sqrt(s_win_sum_sq / (double)s_win_count);
             float dbfs = safe_dbfs_from_rms(rms);
@@ -301,6 +636,7 @@ static mic_err_t process_block_and_update_window(void)
             {
                 MIC_DBG("[MIC] WARNING: saturation suspected: rms=%.4f peak=%.4f\r\n", (double)rms, (double)s_win_peak);
                 set_error(MIC_ERR_SIGNAL_SATURATED, "ERROR: signal saturated (RMS/PEAK ~ 1.0) - likely DATA stuck or wrong clock/polarity");
+                micfft_invalidate(MIC_ERR_SIGNAL_SATURATED);
 
                 /* Reset window so we don't get stuck returning the same error forever. */
                 s_win_count  = 0u;
@@ -362,11 +698,35 @@ void MIC_Init(void)
     s_have_last_dma   = 0u;
     s_last_dma_words  = MIC_DMA_WORDS;
 
-    s_capture_t0_ms = s_dma_t0_ms;
-    pdm2pcm_reset();
+    s_cb_half_count = 0u;
+    s_cb_full_count = 0u;
+    s_cb_err_count  = 0u;
+    s_cb_half_last_ms = 0u;
+    s_cb_full_last_ms = 0u;
+    s_cb_err_last_ms  = 0u;
+    s_cb_start_ms = 0u;
+    s_cb_full_start_count = 0u;
 
-    MIC_DBG("[MIC] Init done. Window=%ums, samples=%u, decim=%u\r\n",
-            (unsigned)MIC_WINDOW_MS, (unsigned)MIC_WINDOW_SAMPLES, (unsigned)MIC_DECIM_N);
+    s_last_rx_ms = 0u;
+    s_last_rx_words = 0u;
+    s_last_rx_cnt_0000 = 0u;
+    s_last_rx_cnt_ffff = 0u;
+    s_last_rx_transitions = 0u;
+    s_last_rx_minw = 0u;
+    s_last_rx_maxw = 0u;
+    memset(s_last_rx_first, 0, sizeof(s_last_rx_first));
+    s_last_rx_first_n = 0u;
+
+    s_capture_t0_ms = 0u;
+    pdm2pcm_reset();
+    mic_update_rates();
+    micfft_reset();
+
+    MIC_DBG("[MIC] Init done. Window=%ums, target_samples=%lu, decim=%u, fs=%luHz\r\n",
+            (unsigned)MIC_WINDOW_MS,
+            (unsigned long)s_win_target_samples,
+            (unsigned)MIC_DECIM_N,
+            (unsigned long)s_pcm_fs_hz);
 }
 
 mic_err_t MIC_Start(void)
@@ -380,6 +740,11 @@ mic_err_t MIC_Start(void)
     if (s_running)
         return MIC_ERR_OK;
 
+    s_capture_t0_ms = HAL_GetTick();
+    s_cb_start_ms = s_capture_t0_ms;
+    s_cb_full_start_count = s_cb_full_count;
+    mic_update_rates();
+
     /* Start the first DMA block. */
     mic_err_t e = start_dma_block();
     if (e != MIC_ERR_OK)
@@ -387,6 +752,7 @@ mic_err_t MIC_Start(void)
 
     /* Reset PDM->PCM state for each new measurement (continuous or one-shot). */
     pdm2pcm_reset();
+    micfft_reset();
 
     s_running = 1u;
 
@@ -431,6 +797,10 @@ void MIC_Stop(void)
     (void)HAL_SPI_Abort(&hspi1);
     s_running = 0u;
     s_interval_active = 0u;
+    s_dma_circular = 0u;
+    s_spi_done = 0u;
+    s_spi_half = 0u;
+    s_spi_err = 0u;
 }
 
 void MIC_Task(void)
@@ -446,7 +816,57 @@ void MIC_Task(void)
     if (s_spi_err)
     {
         set_error(MIC_ERR_SPI_ERROR, "ERROR: SPI error during capture");
+        micfft_invalidate(MIC_ERR_SPI_ERROR);
         MIC_Stop();
+        return;
+    }
+
+    /* Circular DMA mode: continuous clock, process half/full buffers without restart. */
+    if (s_dma_circular)
+    {
+        /* Timeout if DMA callbacks stop arriving. */
+        if ((HAL_GetTick() - s_dma_last_evt_ms) > MIC_TIMEOUT_MS)
+        {
+            set_error(MIC_ERR_TIMEOUT, "ERROR: DMA timeout (no circular DMA events)");
+            micfft_invalidate(MIC_ERR_TIMEOUT);
+            MIC_Stop();
+            return;
+        }
+
+        uint32_t half_words = MIC_DMA_WORDS / 2u;
+        uint32_t rest_words = MIC_DMA_WORDS - half_words;
+        if (half_words == 0u)
+            return;
+
+        if (s_spi_half)
+        {
+            s_spi_half = 0u;
+            (void)process_words_and_update_window(&s_rx_buf[0], half_words);
+        }
+
+        if (s_spi_done)
+        {
+            s_spi_done = 0u;
+            (void)process_words_and_update_window(&s_rx_buf[half_words], rest_words);
+        }
+
+        /* Interval mode stop condition (if enabled at compile-time). */
+        if (s_interval_active)
+        {
+            uint32_t elapsed = HAL_GetTick() - s_interval_t0_ms;
+            uint32_t target  = mic_get_target_ms();
+            if (elapsed >= target)
+            {
+                if (s_last_err == MIC_ERR_NO_DATA_YET)
+                {
+                    set_error(MIC_ERR_TIMEOUT, "ERROR: interval finished but no valid window");
+                    micfft_invalidate(MIC_ERR_TIMEOUT);
+                }
+                MIC_Stop();
+                s_interval_active = 0u;
+            }
+        }
+
         return;
     }
 
@@ -456,39 +876,16 @@ void MIC_Task(void)
         if ((HAL_GetTick() - s_dma_t0_ms) > MIC_TIMEOUT_MS)
         {
             set_error(MIC_ERR_TIMEOUT, "ERROR: DMA timeout waiting for RxCplt");
+            micfft_invalidate(MIC_ERR_TIMEOUT);
             MIC_Stop();
         }
         return;
     }
+    s_spi_done = 0u;
 
     /* DMA complete: process the received block. */
-    (void)process_block_and_update_window();
+    (void)process_words_and_update_window(s_rx_buf, MIC_DMA_WORDS);
 
-    /*
-     * Interval mode: keep restarting DMA until the target capture time elapses,
-     * then compute RMS and stop.
-     */
-    if (s_interval_active)
-    {
-        uint32_t elapsed = HAL_GetTick() - s_interval_t0_ms;
-        uint32_t target  = mic_get_target_ms();
-
-        if (elapsed < target)
-        {
-            (void)start_dma_block();
-            return;
-        }
-        /* Interval finished: do not start another DMA block. */
-    }
-
-    /* Continuous mode: always restart DMA. */
-    if (mic_get_target_ms() == 0u)
-    {
-        (void)start_dma_block();
-        return;
-    }
-
-    /* ===== interval-finish (elapsed>=target) ===== */
     if (s_interval_active)
     {
         uint32_t elapsed = HAL_GetTick() - s_interval_t0_ms;
@@ -496,41 +893,24 @@ void MIC_Task(void)
 
         if (elapsed >= target)
         {
-            if (s_win_count == 0u)
+            if (s_last_err == MIC_ERR_NO_DATA_YET)
             {
-                set_error(MIC_ERR_TIMEOUT, "ERROR: interval finished but no samples collected");
-                MIC_Stop();
-                s_interval_active = 0u;
-                return;
+                set_error(MIC_ERR_TIMEOUT, "ERROR: interval finished but no valid window");
+                mic_err_t e = MIC_ERR_TIMEOUT;
+                micfft_invalidate(e);
             }
-
-            float rms = (float)sqrt(s_win_sum_sq / (double)s_win_count);
-            float dbfs = safe_dbfs_from_rms(rms);
-
-            if (rms > 0.98f || s_win_peak > 0.98)
-            {
-                set_error(MIC_ERR_SIGNAL_SATURATED, "ERROR: signal saturated (interval RMS/PEAK ~ 1.0)");
-                MIC_Stop();
-                s_interval_active = 0u;
-                return;
-            }
-
-            s_last_rms  = rms;
-            s_last_dbfs = dbfs;
-            s_last_err  = MIC_ERR_OK;
-            s_last_err_msg = NULL;
-
-            MIC_DBG("[MIC] Interval %lums done: n=%lu rms=%.4f dbfs=%.2f\r\n",
-                    (unsigned long)target,
-                    (unsigned long)s_win_count,
-                    (double)rms,
-                    (double)dbfs);
-
             MIC_Stop();
             s_interval_active = 0u;
             return;
         }
+
+        (void)start_dma_block();
+        return;
     }
+
+    /* Continuous mode: always restart DMA. */
+    if (mic_get_target_ms() == 0u)
+        (void)start_dma_block();
 }
 
 mic_err_t MIC_GetLast50ms(float *out_dbfs, float *out_rms)
@@ -603,4 +983,556 @@ float MIC_ReadDbFS_Debug(void)
     MIC_Stop();
     s_debug = prev_dbg;
     return out;
+}
+
+const char* MIC_ErrName(mic_err_t e)
+{
+    switch (e)
+    {
+        case MIC_ERR_OK: return "OK";
+        case MIC_ERR_NOT_INIT: return "NOT_INIT";
+        case MIC_ERR_SPI_NOT_READY: return "SPI_NOT_READY";
+        case MIC_ERR_START_DMA: return "START_DMA";
+        case MIC_ERR_TIMEOUT: return "TIMEOUT";
+        case MIC_ERR_SPI_ERROR: return "SPI_ERROR";
+        case MIC_ERR_DMA_NO_WRITE: return "DMA_NO_WRITE";
+        case MIC_ERR_DATA_STUCK: return "DATA_STUCK";
+        case MIC_ERR_SIGNAL_SATURATED: return "SIGNAL_SATURATED";
+        case MIC_ERR_NO_DATA_YET: return "NO_DATA_YET";
+        default: return "UNKNOWN";
+    }
+}
+
+static mic_err_t mic_ensure_started(void)
+{
+    mic_err_t st = MIC_Start();
+    if (st == MIC_ERR_NOT_INIT)
+    {
+        MIC_Init();
+        st = MIC_Start();
+    }
+    return st;
+}
+
+mic_err_t MIC_ReadDbfsX100_Blocking(uint32_t timeout_ms, int16_t *out_dbfs_x100)
+{
+    if (out_dbfs_x100) *out_dbfs_x100 = 0;
+    const uint8_t auto_stop = (mic_get_target_ms() != 0u) ? 1u : 0u;
+
+    mic_err_t start = mic_ensure_started();
+    if (start != MIC_ERR_OK)
+        return start;
+
+    float dbfs = 0.0f;
+    float rms  = 0.0f;
+    mic_err_t st = MIC_GetLast50ms(&dbfs, &rms);
+
+    uint32_t t0 = HAL_GetTick();
+    while ((st == MIC_ERR_NO_DATA_YET || st == MIC_ERR_DATA_STUCK) && ((HAL_GetTick() - t0) < timeout_ms))
+    {
+        MIC_Task();
+        __WFI();
+        st = MIC_GetLast50ms(&dbfs, &rms);
+    }
+
+    if (st != MIC_ERR_OK)
+    {
+        if (auto_stop) MIC_Stop();
+        return st;
+    }
+
+    if (out_dbfs_x100)
+        *out_dbfs_x100 = mic_dbfs_to_x100_i16(dbfs);
+    if (auto_stop) MIC_Stop();
+    return MIC_ERR_OK;
+}
+
+mic_err_t MIC_FFT_GetLastBinsDbX100(int16_t *out_lf_db_x100,
+                                   int16_t *out_mf_db_x100,
+                                   int16_t *out_hf_db_x100)
+{
+    if (out_lf_db_x100) *out_lf_db_x100 = 0;
+    if (out_mf_db_x100) *out_mf_db_x100 = 0;
+    if (out_hf_db_x100) *out_hf_db_x100 = 0;
+
+    /* If mic capture is in trouble, surface that first. */
+    if (s_last_err != MIC_ERR_OK && s_last_err != MIC_ERR_NO_DATA_YET)
+        return s_last_err;
+
+    if (!s_fft_have_bins)
+        return s_fft_last_err;
+
+    if (out_lf_db_x100) *out_lf_db_x100 = s_fft_last_lf_db_x100;
+    if (out_mf_db_x100) *out_mf_db_x100 = s_fft_last_mf_db_x100;
+    if (out_hf_db_x100) *out_hf_db_x100 = s_fft_last_hf_db_x100;
+    return MIC_ERR_OK;
+}
+
+mic_err_t MIC_FFT_WaitBinsDbX100(uint32_t timeout_ms,
+                                int16_t *out_lf_db_x100,
+                                int16_t *out_mf_db_x100,
+                                int16_t *out_hf_db_x100)
+{
+    if (out_lf_db_x100) *out_lf_db_x100 = 0;
+    if (out_mf_db_x100) *out_mf_db_x100 = 0;
+    if (out_hf_db_x100) *out_hf_db_x100 = 0;
+    const uint8_t auto_stop = (mic_get_target_ms() != 0u) ? 1u : 0u;
+
+    mic_err_t start = mic_ensure_started();
+    if (start != MIC_ERR_OK)
+        return start;
+
+    mic_err_t st = MIC_FFT_GetLastBinsDbX100(out_lf_db_x100, out_mf_db_x100, out_hf_db_x100);
+
+    uint32_t t0 = HAL_GetTick();
+    while ((st == MIC_ERR_NO_DATA_YET || st == MIC_ERR_DATA_STUCK) && ((HAL_GetTick() - t0) < timeout_ms))
+    {
+        MIC_Task();
+        __WFI();
+        st = MIC_FFT_GetLastBinsDbX100(out_lf_db_x100, out_mf_db_x100, out_hf_db_x100);
+    }
+
+    if (auto_stop) MIC_Stop();
+    return st;
+}
+
+/* =====================================================================================
+ * USB CLI helper: FINDMIC (debug)
+ * ===================================================================================== */
+
+typedef struct
+{
+    uint32_t words;
+    uint32_t cnt_0000;
+    uint32_t cnt_ffff;
+    uint32_t transitions;
+    uint32_t ones;
+    uint16_t minw;
+    uint16_t maxw;
+    uint16_t first[8];
+    uint32_t first_n;
+    HAL_StatusTypeDef last_hal;
+} micfind_stats_t;
+
+static void micfind_writef(mic_write_fn_t write, const char *fmt, ...)
+{
+    if (!write || !fmt) return;
+    char buf[200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    write(buf);
+}
+
+static void micfind_pa6_set_input(uint32_t pull)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef gi = {0};
+    gi.Pin = GPIO_PIN_6;
+    gi.Mode = GPIO_MODE_INPUT;
+    gi.Pull = pull;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &gi);
+}
+
+static void micfind_pa6_set_spi_af(uint32_t pull)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef gi = {0};
+    gi.Pin = GPIO_PIN_6;
+    gi.Mode = GPIO_MODE_AF_PP;
+    gi.Pull = pull;
+    gi.Speed = GPIO_SPEED_FREQ_HIGH;
+    gi.Alternate = GPIO_AF5_SPI1;
+    HAL_GPIO_Init(GPIOA, &gi);
+}
+
+static uint8_t micfind_pa6_read(void)
+{
+    return (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6) == GPIO_PIN_SET) ? 1u : 0u;
+}
+
+static void micfind_pa6_pull_diagnose(mic_write_fn_t write)
+{
+    /* Release SPI pin first (otherwise pull changes may be ignored by AF). */
+    micfind_pa6_set_input(GPIO_NOPULL);
+    HAL_Delay(1);
+    uint8_t np = micfind_pa6_read();
+
+    micfind_pa6_set_input(GPIO_PULLDOWN);
+    HAL_Delay(1);
+    uint8_t pd = micfind_pa6_read();
+
+    micfind_pa6_set_input(GPIO_PULLUP);
+    HAL_Delay(1);
+    uint8_t pu = micfind_pa6_read();
+
+    micfind_writef(write, "FINDMIC: PA6(DATA) idle level: NOPULL=%u PULLDOWN=%u PULLUP=%u\r\n",
+                   (unsigned)np, (unsigned)pd, (unsigned)pu);
+
+    if ((pd == 0u) && (pu == 1u))
+        micfind_writef(write, "FINDMIC: PA6 follows pulls => likely floating/Hi-Z (mic not driving / wrong pin / no power / level mismatch)\r\n");
+    else if ((pd == 0u) && (pu == 0u))
+        micfind_writef(write, "FINDMIC: PA6 always LOW => short to GND / mic holding low / logic threshold issue\r\n");
+    else if ((pd == 1u) && (pu == 1u))
+        micfind_writef(write, "FINDMIC: PA6 always HIGH => short to VDD / external pull-up too strong\r\n");
+}
+
+static void micdiag_pa6_pull_diagnose(mic_write_fn_t write)
+{
+    /* Release SPI pin first (otherwise pull changes may be ignored by AF). */
+    micfind_pa6_set_input(GPIO_NOPULL);
+    HAL_Delay(1);
+    uint8_t np = micfind_pa6_read();
+
+    micfind_pa6_set_input(GPIO_PULLDOWN);
+    HAL_Delay(1);
+    uint8_t pd = micfind_pa6_read();
+
+    micfind_pa6_set_input(GPIO_PULLUP);
+    HAL_Delay(1);
+    uint8_t pu = micfind_pa6_read();
+
+    micfind_writef(write, "MICDIAG: PA6(DATA) idle level: NOPULL=%u PULLDOWN=%u PULLUP=%u\r\n",
+                   (unsigned)np, (unsigned)pd, (unsigned)pu);
+
+    if ((pd == 0u) && (pu == 1u))
+        micfind_writef(write, "MICDIAG: PA6 follows pulls => likely floating/Hi-Z (wrong pin / mic not driving / no power)\r\n");
+    else if ((pd == 0u) && (pu == 0u))
+        micfind_writef(write, "MICDIAG: PA6 always LOW => mic holds low (sleep?) / short to GND / logic threshold issue\r\n");
+    else if ((pd == 1u) && (pu == 1u))
+        micfind_writef(write, "MICDIAG: PA6 always HIGH => short to VDD / strong external pull-up\r\n");
+}
+
+static const char* mic_pull_name(uint32_t pull)
+{
+    switch (pull)
+    {
+        case GPIO_NOPULL: return "NOPULL";
+        case GPIO_PULLUP: return "PULLUP";
+        case GPIO_PULLDOWN: return "PULLDOWN";
+        default: return "UNKNOWN";
+    }
+}
+
+void MIC_WriteDiag(mic_write_fn_t write)
+{
+    if (!write) return;
+
+    uint32_t now = HAL_GetTick();
+
+    mic_err_t last_err = s_last_err;
+    const char *last_msg = s_last_err_msg;
+
+    uint8_t inited   = s_inited;
+    uint8_t running  = s_running;
+    uint8_t interval = s_interval_active;
+    uint8_t dma_circ = s_dma_circular;
+
+    uint32_t spi_state = (uint32_t)HAL_SPI_GetState(&hspi1);
+    uint32_t spi_err   = (uint32_t)hspi1.ErrorCode;
+
+    uint32_t pclk = HAL_RCC_GetPCLK1Freq();
+    if (pclk == 0u) pclk = HAL_RCC_GetHCLKFreq();
+    uint32_t div  = mic_spi_prescaler_div(hspi1.Init.BaudRatePrescaler);
+    uint32_t sck  = (div != 0u) ? (pclk / div) : 0u;
+    uint32_t bits = mic_spi_bits_per_word();
+
+    uint32_t cb_half = s_cb_half_count;
+    uint32_t cb_full = s_cb_full_count;
+    uint32_t cb_err  = s_cb_err_count;
+
+    uint32_t dma_ccr = 0u;
+    uint32_t dma_cndtr = 0u;
+    if (hspi1.hdmarx && hspi1.hdmarx->Instance)
+    {
+        dma_ccr = hspi1.hdmarx->Instance->CCR;
+        dma_cndtr = hspi1.hdmarx->Instance->CNDTR;
+    }
+
+    uint32_t last_evt_age = (s_dma_last_evt_ms != 0u) ? (now - s_dma_last_evt_ms) : 0xFFFFFFFFu;
+    uint32_t last_rx_age  = (s_last_rx_ms != 0u) ? (now - s_last_rx_ms) : 0xFFFFFFFFu;
+
+    uint32_t elapsed_ms = (s_cb_start_ms != 0u) ? (now - s_cb_start_ms) : 0u;
+    uint32_t delta_full = cb_full - s_cb_full_start_count;
+    uint64_t words_captured = (uint64_t)delta_full * (uint64_t)MIC_DMA_WORDS;
+    uint32_t words_per_s = 0u;
+    uint32_t sck_est_hz = 0u;
+    if (elapsed_ms != 0u)
+    {
+        words_per_s = (uint32_t)((words_captured * 1000ull) / (uint64_t)elapsed_ms);
+        sck_est_hz = words_per_s * bits;
+    }
+
+    micfind_writef(write, "MICDIAG: inited=%u running=%u interval=%u dma_circ=%u spi_state=%lu spi_err=0x%08lX\r\n",
+                   (unsigned)inited, (unsigned)running, (unsigned)interval, (unsigned)dma_circ,
+                   (unsigned long)spi_state, (unsigned long)spi_err);
+    micfind_writef(write, "MICDIAG: last=%s(%ld) msg=%s\r\n",
+                   MIC_ErrName(last_err), (long)last_err, last_msg ? last_msg : "");
+    micfind_writef(write, "MICDIAG: PCLK1=%luHz presc=%lu => SCK~%luHz bits=%lu decim=%u fs~%luHz\r\n",
+                   (unsigned long)pclk, (unsigned long)div, (unsigned long)sck, (unsigned long)bits,
+                   (unsigned)MIC_DECIM_N, (unsigned long)s_pcm_fs_hz);
+    micfind_writef(write, "MICDIAG: dma CCR=0x%08lX CNDTR=%lu last_evt_age=%lums cb_half=%lu cb_full=%lu cb_err=%lu sck_est~%luHz\r\n",
+                   (unsigned long)dma_ccr, (unsigned long)dma_cndtr, (unsigned long)last_evt_age,
+                   (unsigned long)cb_half, (unsigned long)cb_full, (unsigned long)cb_err,
+                   (unsigned long)sck_est_hz);
+    micfind_writef(write, "MICDIAG: last_rx age=%lums words=%lu 0000=%lu ffff=%lu trans=%lu min=0x%04X max=0x%04X\r\n",
+                   (unsigned long)last_rx_age,
+                   (unsigned long)s_last_rx_words,
+                   (unsigned long)s_last_rx_cnt_0000,
+                   (unsigned long)s_last_rx_cnt_ffff,
+                   (unsigned long)s_last_rx_transitions,
+                   (unsigned)s_last_rx_minw,
+                   (unsigned)s_last_rx_maxw);
+
+    if (s_last_rx_first_n)
+    {
+        micfind_writef(write, "MICDIAG: first:");
+        for (uint32_t i = 0; i < s_last_rx_first_n; i++)
+            micfind_writef(write, " %04X", (unsigned)s_last_rx_first[i]);
+        micfind_writef(write, "\r\n");
+    }
+
+    if (running)
+    {
+        micfind_writef(write, "MICDIAG: pausing capture for PA6 pull-test...\r\n");
+        MIC_Stop();
+        HAL_Delay(2);
+    }
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    uint32_t saved_pull = GPIO_NOPULL;
+    uint32_t pupd_bits = (GPIOA->PUPDR >> (6u * 2u)) & 0x3u;
+    if (pupd_bits == 1u) saved_pull = GPIO_PULLUP;
+    else if (pupd_bits == 2u) saved_pull = GPIO_PULLDOWN;
+
+    micdiag_pa6_pull_diagnose(write);
+
+    /* Restore PA6 to SPI AF with the original pull. */
+    micfind_pa6_set_spi_af(saved_pull);
+    micfind_writef(write, "MICDIAG: PA6 restored to SPI AF (pull=%s)\r\n", mic_pull_name(saved_pull));
+
+    if (running)
+    {
+        (void)MIC_Start();
+        micfind_writef(write, "MICDIAG: capture restarted\r\n");
+    }
+}
+
+static void micfind_stats_reset(micfind_stats_t *s)
+{
+    if (!s) return;
+    memset(s, 0, sizeof(*s));
+    s->minw = 0xFFFFu;
+    s->maxw = 0x0000u;
+    s->last_hal = HAL_OK;
+}
+
+static void micfind_stats_feed(micfind_stats_t *s, const uint16_t *buf, uint32_t n, uint16_t *io_prev, uint8_t *io_have_prev)
+{
+    if (!s || !buf || n == 0u) return;
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        uint16_t w = buf[i];
+        if (s->first_n < (uint32_t)(sizeof(s->first) / sizeof(s->first[0])))
+            s->first[s->first_n++] = w;
+
+        if (w == 0x0000u) s->cnt_0000++;
+        if (w == 0xFFFFu) s->cnt_ffff++;
+        if (w < s->minw) s->minw = w;
+        if (w > s->maxw) s->maxw = w;
+        s->ones += popcount16_inline(w);
+
+        if (io_have_prev && io_prev)
+        {
+            if (*io_have_prev)
+            {
+                if (w != *io_prev) s->transitions++;
+            }
+            else
+            {
+                *io_have_prev = 1u;
+            }
+            *io_prev = w;
+        }
+
+        s->words++;
+    }
+}
+
+static HAL_StatusTypeDef micfind_rx_words(uint16_t *buf, uint16_t words)
+{
+    if (!buf || words == 0u) return HAL_ERROR;
+    return HAL_SPI_Receive(&hspi1, (uint8_t*)buf, words, 500u);
+}
+
+static void micfind_clock_for_ms(uint32_t ms)
+{
+    uint16_t buf[256];
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < ms)
+    {
+        (void)micfind_rx_words(buf, (uint16_t)(sizeof(buf) / sizeof(buf[0])));
+    }
+}
+
+static void micfind_print_stats(mic_write_fn_t write, const char *tag, uint32_t cpol, uint32_t cpha, const micfind_stats_t *s)
+{
+    if (!s) return;
+
+    uint32_t bad = s->cnt_0000 + s->cnt_ffff;
+    double ones_pct = (s->words != 0u) ? (100.0 * (double)s->ones / (double)(s->words * 16u)) : 0.0;
+    double bad_pct  = (s->words != 0u) ? (100.0 * (double)bad / (double)s->words) : 0.0;
+
+    micfind_writef(write, "%s CPOL=%s CPHA=%s: words=%lu bad=%lu(%.1f%%) ones=%.1f%% trans=%lu min=0x%04X max=0x%04X\r\n",
+                   tag,
+                   (cpol == SPI_POLARITY_LOW) ? "LOW" : "HIGH",
+                   (cpha == SPI_PHASE_1EDGE) ? "1EDGE" : "2EDGE",
+                   (unsigned long)s->words,
+                   (unsigned long)bad, bad_pct,
+                   ones_pct,
+                   (unsigned long)s->transitions,
+                   (unsigned int)s->minw,
+                   (unsigned int)s->maxw);
+
+    micfind_writef(write, "  first:");
+    for (uint32_t i = 0; i < s->first_n; i++)
+        micfind_writef(write, " %04X", (unsigned int)s->first[i]);
+    micfind_writef(write, "\r\n");
+}
+
+void MIC_FindMic(mic_write_fn_t write)
+{
+    if (!write) return;
+
+    micfind_writef(write, "FINDMIC: testing SPI1 edges for PDM data\r\n");
+    micfind_writef(write, "FINDMIC: expected wiring: PA5=CLK(SPI1_SCK), PA6=DATA(SPI1_MISO)\r\n");
+    micfind_writef(write, "FINDMIC: mic wake-up delay: %lums\r\n", (unsigned long)MIC_WAKEUP_MS);
+
+    MIC_Stop();
+    (void)HAL_SPI_Abort(&hspi1);
+  
+    SPI_InitTypeDef saved = hspi1.Init;
+  
+    (void)HAL_SPI_DeInit(&hspi1);
+    micfind_pa6_pull_diagnose(write);
+
+    struct { uint32_t cpol; uint32_t cpha; const char *tag; } modes[] =
+    {
+        { SPI_POLARITY_LOW,  SPI_PHASE_1EDGE, "mode0" },
+        { SPI_POLARITY_LOW,  SPI_PHASE_2EDGE, "mode1" },
+        { SPI_POLARITY_HIGH, SPI_PHASE_1EDGE, "mode2" },
+        { SPI_POLARITY_HIGH, SPI_PHASE_2EDGE, "mode3" },
+    };
+
+    uint32_t best_i = 0xFFFFFFFFu;
+    uint32_t best_bad = 0xFFFFFFFFu;
+    uint32_t best_trans = 0u;
+
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(modes) / sizeof(modes[0])); i++)
+    {
+        (void)HAL_SPI_DeInit(&hspi1);
+        hspi1.Init = saved;
+        hspi1.Init.CLKPolarity = modes[i].cpol;
+        hspi1.Init.CLKPhase    = modes[i].cpha;
+
+        if (HAL_SPI_Init(&hspi1) != HAL_OK)
+        {
+            micfind_writef(write, "%s: HAL_SPI_Init failed\r\n", modes[i].tag);
+            continue;
+        }
+
+        /* Default CubeMX uses GPIO_PULLDOWN on PA6; keep as baseline. */
+        micfind_pa6_set_spi_af(GPIO_PULLDOWN);
+
+        /* Keep clock running while mic wakes up (do not HAL_Delay here). */
+        if (MIC_WAKEUP_MS != 0u)
+            micfind_clock_for_ms((uint32_t)MIC_WAKEUP_MS);
+
+        micfind_stats_t st;
+        micfind_stats_reset(&st);
+
+        uint16_t buf[256];
+        uint16_t prev = 0;
+        uint8_t have_prev = 0u;
+
+        const uint32_t total_words = 2048u;
+        uint32_t left = total_words;
+        while (left)
+        {
+            uint16_t chunk = (left > (uint32_t)(sizeof(buf) / sizeof(buf[0]))) ? (uint16_t)(sizeof(buf) / sizeof(buf[0])) : (uint16_t)left;
+            st.last_hal = micfind_rx_words(buf, chunk);
+            if (st.last_hal != HAL_OK) break;
+            micfind_stats_feed(&st, buf, chunk, &prev, &have_prev);
+            left -= (uint32_t)chunk;
+        }
+
+        micfind_print_stats(write, modes[i].tag, modes[i].cpol, modes[i].cpha, &st);
+
+        /* If stuck at 0x0000/0xFFFF, quickly retry with opposite pull to detect floating/open-drain. */
+        if ((st.last_hal == HAL_OK) && (st.words != 0u) && ((st.cnt_0000 == st.words) || (st.cnt_ffff == st.words)))
+        {
+            uint32_t alt_pull = (st.cnt_0000 == st.words) ? GPIO_PULLUP : GPIO_PULLDOWN;
+            const char *alt_tag = (alt_pull == GPIO_PULLUP) ? "+PU" : "+PD";
+            micfind_pa6_set_spi_af(alt_pull);
+
+            micfind_stats_t st2;
+            micfind_stats_reset(&st2);
+            uint16_t buf2[256];
+            uint16_t prev2 = 0;
+            uint8_t have_prev2 = 0u;
+            uint32_t left2 = total_words;
+            while (left2)
+            {
+                uint16_t chunk2 = (left2 > (uint32_t)(sizeof(buf2) / sizeof(buf2[0]))) ? (uint16_t)(sizeof(buf2) / sizeof(buf2[0])) : (uint16_t)left2;
+                st2.last_hal = micfind_rx_words(buf2, chunk2);
+                if (st2.last_hal != HAL_OK) break;
+                micfind_stats_feed(&st2, buf2, chunk2, &prev2, &have_prev2);
+                left2 -= (uint32_t)chunk2;
+            }
+
+            char tagbuf[12];
+            snprintf(tagbuf, sizeof(tagbuf), "%s%s", modes[i].tag, alt_tag);
+            micfind_print_stats(write, tagbuf, modes[i].cpol, modes[i].cpha, &st2);
+        }
+
+        uint32_t bad = st.cnt_0000 + st.cnt_ffff;
+        if ((st.last_hal == HAL_OK) && (st.words != 0u))
+        {
+            if ((bad < best_bad) || ((bad == best_bad) && (st.transitions > best_trans)))
+            {
+                best_bad = bad;
+                best_trans = st.transitions;
+                best_i = i;
+            }
+        }
+    }
+
+    if ((best_i != 0xFFFFFFFFu) && (best_bad < 2048u))
+    {
+        (void)HAL_SPI_DeInit(&hspi1);
+        hspi1.Init = saved;
+        hspi1.Init.CLKPolarity = modes[best_i].cpol;
+        hspi1.Init.CLKPhase    = modes[best_i].cpha;
+        if (HAL_SPI_Init(&hspi1) == HAL_OK)
+        {
+            micfind_writef(write, "FINDMIC: selected %s (apply now). Suggested MX_SPI1_Init: CLKPolarity=%s, CLKPhase=%s\r\n",
+                           modes[best_i].tag,
+                           (modes[best_i].cpol == SPI_POLARITY_LOW) ? "LOW" : "HIGH",
+                           (modes[best_i].cpha == SPI_PHASE_1EDGE) ? "1EDGE" : "2EDGE");
+        }
+    }
+    else
+    {
+        (void)HAL_SPI_DeInit(&hspi1);
+        hspi1.Init = saved;
+        (void)HAL_SPI_Init(&hspi1);
+        micfind_writef(write, "FINDMIC: no mode produced non-stuck data. Check wiring/power/LR pin.\r\n");
+    }
+
+    MIC_Init();
 }

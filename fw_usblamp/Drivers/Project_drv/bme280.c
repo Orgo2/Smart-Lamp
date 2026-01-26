@@ -28,9 +28,6 @@ extern I2C_HandleTypeDef hi2c1;
 #define BME280_FILTER_16        0x04
 #define BME280_STANDBY_0_5_MS   0x00
 
-#define BME280_TIMEOUT_MS       5000
-#define BME280_I2C_TIMEOUT_MS   500   /* I2C operation timeout. */
-
 typedef struct {
     uint16_t dig_T1;
     int16_t  dig_T2;

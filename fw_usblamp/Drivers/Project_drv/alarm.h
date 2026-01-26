@@ -14,4 +14,7 @@ void BEEP(uint16_t freq_hz, uint8_t volume, float time_s);
 /* Call periodically to run any deferred BEEP() request made from ISR context. */
 void BEEP_Task(void);
 
+/* Returns 1 while the beeper is active (use this to avoid STOP2 while beeping). */
+uint8_t BEEP_IsActive(void);
+
 #endif /* PROJECT_DRV_ALARM_H_ */

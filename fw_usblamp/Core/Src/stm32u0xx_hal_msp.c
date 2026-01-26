@@ -272,7 +272,7 @@ void HAL_LPTIM_MspInit(LPTIM_HandleTypeDef* hlptim)
   /** Initializes the peripherals clocks
   */
     PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_LPTIM2;
-    PeriphClkInit.Lptim2ClockSelection = RCC_LPTIM2CLKSOURCE_HSI;
+    PeriphClkInit.Lptim2ClockSelection = RCC_LPTIM2CLKSOURCE_LSE;
     if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
     {
       Error_Handler();
@@ -500,8 +500,8 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
     hdma_spi1_rx.Init.MemInc = DMA_MINC_ENABLE;
     hdma_spi1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
     hdma_spi1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
-    hdma_spi1_rx.Init.Mode = DMA_NORMAL;
-    hdma_spi1_rx.Init.Priority = DMA_PRIORITY_MEDIUM;
+    hdma_spi1_rx.Init.Mode = DMA_CIRCULAR;
+    hdma_spi1_rx.Init.Priority = DMA_PRIORITY_HIGH;
     if (HAL_DMA_Init(&hdma_spi1_rx) != HAL_OK)
     {
       Error_Handler();

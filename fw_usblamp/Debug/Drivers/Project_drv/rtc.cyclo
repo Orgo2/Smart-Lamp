@@ -1,7 +1,9 @@
 ../Drivers/Project_drv/rtc.c:28:19:RTC_Init	1
 ../Drivers/Project_drv/rtc.c:34:19:RTC_ReadClock	4
-../Drivers/Project_drv/rtc.c:68:19:RTC_SetClock	13
-../Drivers/Project_drv/rtc.c:119:19:RTC_SetAlarm	11
-../Drivers/Project_drv/rtc.c:189:19:RTC_SetDailyAlarm	9
-../Drivers/Project_drv/rtc.c:255:19:RTC_GetDailyAlarm	6
-../Drivers/Project_drv/rtc.c:280:6:HAL_RTC_AlarmAEventCallback	7
+../Drivers/Project_drv/rtc.c:68:19:RTC_GetYMDHMS	9
+../Drivers/Project_drv/rtc.c:87:19:RTC_SetClock	13
+../Drivers/Project_drv/rtc.c:138:6:RTC_WriteTimeYMDHM	3
+../Drivers/Project_drv/rtc.c:154:19:RTC_SetAlarm	11
+../Drivers/Project_drv/rtc.c:224:19:RTC_SetDailyAlarm	9
+../Drivers/Project_drv/rtc.c:290:19:RTC_GetDailyAlarm	6
+../Drivers/Project_drv/rtc.c:315:6:HAL_RTC_AlarmAEventCallback	7

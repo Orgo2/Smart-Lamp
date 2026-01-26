@@ -106,6 +106,8 @@ static void BL_Task(void);
 void HAL_SYSTICK_Callback(void);
 static void LowBattery_Task(void);
 static void LowBattery_EarlyGate(void);
+static float vbat_read_blocking(uint32_t timeout_ms);
+static void EnterLowBatteryStandby(void);
 static void NoProgram_SleepUntilUSB(void);
 static void EnterStop(void);
 static void Power_MinimizeLoads(void);
@@ -675,6 +677,42 @@ static void MX_RTC_Init(void)
   }
   /* USER CODE END Check_RTC_BKUP */
 
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Enable the Alarm A
+  */
+  sAlarm.AlarmTime.Hours = 0x0;
+  sAlarm.AlarmTime.Minutes = 0x0;
+  sAlarm.AlarmTime.Seconds = 0x0;
+  sAlarm.AlarmTime.SubSeconds = 0x0;
+  sAlarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY|RTC_ALARMMASK_SECONDS;
+  sAlarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+  sAlarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+  sAlarm.AlarmDateWeekDay = 0x1;
+  sAlarm.Alarm = RTC_ALARM_A;
+  if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
@@ -702,9 +740,9 @@ static void MX_SPI1_Init(void)
   hspi1.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
   hspi1.Init.DataSize = SPI_DATASIZE_16BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -1060,41 +1098,71 @@ void LP_DELAY(uint32_t ms)
   }
 
   /* RTC WUT @ RTCCLK/16 = 32768/16 = 2048 Hz (0.488 ms resolution), max ~32 s per shot. */
+  /* NOTE: On battery we also watch B1 long-hold during STOP2 delays so program switching works even inside delay(). */
+  static uint32_t s_b1_hold_ms = 0u;
   while (ms)
   {
     uint32_t chunk_ms = ms;
-    if (chunk_ms > 32000u) chunk_ms = 32000u;
+    /* Keep chunks short so we can observe button release while mostly sleeping. */
+    if (chunk_ms > 50u) chunk_ms = 50u;
 
-    B2_Hold_Service_Blocking();
-    uint32_t ticks = (chunk_ms * 2048u + 999u) / 1000u;
-    if (ticks < 1u) ticks = 1u;
-    if (ticks > 65536u) ticks = 65536u;
-
-    s_mp_wut_fired = 0u;
-    (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-
-    if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, (uint32_t)(ticks - 1u), RTC_WAKEUPCLOCK_RTCCLK_DIV16, 0u) != HAL_OK)
+    /* While beeping (LPTIM2 from HSI), avoid STOP2 so PWM stays stable. */
+    if (BEEP_IsActive() != 0u)
     {
-      /* Fallback to light sleep if WUT setup fails. */
       lp_delay_sleep_ms(chunk_ms);
     }
     else
     {
-      while (!s_mp_wut_fired)
-      {
-        B2_Hold_Service_Blocking();
-        __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
-        HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
-        SystemClock_Config();
+      B2_Hold_Service_Blocking();
+      uint32_t ticks = (chunk_ms * 2048u + 999u) / 1000u;
+      if (ticks < 1u) ticks = 1u;
+      if (ticks > 65536u) ticks = 65536u;
 
-        /* If we woke because of B2, stay awake in light sleep so HAL_GetTick() can count the 2s hold. */
-        B2_Hold_Service_Blocking();
-      }
+      s_mp_wut_fired = 0u;
       (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+      __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+
+      if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, (uint32_t)(ticks - 1u), RTC_WAKEUPCLOCK_RTCCLK_DIV16, 0u) != HAL_OK)
+      {
+        /* Fallback to light sleep if WUT setup fails. */
+        lp_delay_sleep_ms(chunk_ms);
+      }
+      else
+      {
+        while (!s_mp_wut_fired)
+        {
+          B2_Hold_Service_Blocking();
+          __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+          HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+          SystemClock_Config();
+
+          /* If we woke because of B2, stay awake in light sleep so HAL_GetTick() can count the 2s hold. */
+          B2_Hold_Service_Blocking();
+        }
+        (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+      }
     }
 
     ms -= chunk_ms;
+
+    /* B1 long-hold (2s) triggers "next program" even if we're inside LP_DELAY (e.g., delay() in Pascal). */
+    uint8_t b1 = (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_SET) ? 1u : 0u;
+    if (b1)
+    {
+      if (s_b1_hold_ms < (0xFFFFFFFFu - chunk_ms)) s_b1_hold_ms += chunk_ms;
+      else s_b1_hold_ms = 0xFFFFFFFFu;
+    }
+    else if (s_b1_hold_ms != 0u)
+    {
+      if (s_b1_hold_ms >= MP_BTN_LONG_MS)
+      {
+        s_b1_hold_ms = 0u;
+        mp_notify_button_long(1u);
+        (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+        return;
+      }
+      s_b1_hold_ms = 0u;
+    }
   }
 }
 
@@ -1259,6 +1327,21 @@ static void EnterStop(void)
         /* If B1 is already held (e.g., wake from shutdown), accept it without entering STOP2. */
         if (B1_WaitHeld(B1_WAKE_HOLD_MS))
         {
+            float vbat = vbat_read_blocking(50);
+            if (vbat < CHARGER_VBAT_CRITICAL)
+            {
+                /* Low battery: indicate 2x (100ms on / 200ms gap), then go to standby. */
+                for (uint8_t i = 0; i < 2; i++)
+                {
+                    IND_LED_On();
+                    LP_DELAY(100);
+                    IND_LED_Off();
+                    LP_DELAY(200);
+                }
+                HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0xB007u);
+                EnterLowBatteryStandby();
+                return;
+            }
             s_battery_run_allowed = 1u;
             mp_request_run_loaded();
             return;
@@ -1291,6 +1374,21 @@ static void EnterStop(void)
             s_stop2_woke_by_b1 = 0u;
             if (B1_WaitHeld(B1_WAKE_HOLD_MS))
             {
+                float vbat = vbat_read_blocking(50);
+                if (vbat < CHARGER_VBAT_CRITICAL)
+                {
+                    /* Low battery: indicate 2x (100ms on / 200ms gap), then go to standby. */
+                    for (uint8_t i = 0; i < 2; i++)
+                    {
+                        IND_LED_On();
+                        LP_DELAY(100);
+                        IND_LED_Off();
+                        LP_DELAY(200);
+                    }
+                    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0xB007u);
+                    EnterLowBatteryStandby();
+                    return;
+                }
                 s_battery_run_allowed = 1u;
                 mp_request_run_loaded();
                 return;
