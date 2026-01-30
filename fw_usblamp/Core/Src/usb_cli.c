@@ -5,6 +5,7 @@
 #include "rtc.h"
 #include "charger.h"
 #include "mic.h"
+#include "alarm.h"
 #include <MiniPascal.h>
 #include "memmon.h"
 
@@ -83,6 +84,37 @@ static bool cli_is_call0(const char *line, const char *fname)
     return (*p == 0);
 }
 
+static bool cli_is_call1_float(const char *line, const char *fname, float *out_arg)
+{
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!isalpha((unsigned char)*p) && *p != '_') return false;
+    char name[16];
+    uint8_t i = 0;
+    while ((*p == '_' || isalnum((unsigned char)*p)) && i < (sizeof(name) - 1))
+        name[i++] = *p++;
+    name[i] = 0;
+    if (cli_stricmp(name, fname) != 0) return false;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '(') return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+
+    char *end = NULL;
+    float v = strtof(p, &end);
+    if (end == NULL || end == p) return false;
+    p = end;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != ')') return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != 0) return false;
+
+    if (out_arg) *out_arg = v;
+    return true;
+}
+
 static void dbg_led_blink(uint8_t times)
 {
     /*
@@ -134,6 +166,35 @@ static void cdc_prompt(void)
     cdc_write_str("> ");
 }
 
+static uint8_t cli_wait_enter(uint32_t timeout_ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    uint8_t rx[USB_CLI_RX_CHUNK];
+
+    while (1)
+    {
+        if ((timeout_ms != 0u) && ((HAL_GetTick() - t0) >= timeout_ms))
+            return 0u;
+
+        uint32_t got = 0;
+        uint32_t ret = USBD_CDC_ACM_Receive(rx, sizeof(rx), &got);
+        if (ret != 0)
+            return 0u;
+
+        for (uint32_t i = 0; i < got; i++)
+        {
+            char c = (char)rx[i];
+            if (c == '\r' || c == '\n')
+            {
+                cdc_write_str("\r\n");
+                return 1u;
+            }
+        }
+
+        HAL_Delay(5);
+    }
+}
+
 /* Pascal interpreter mode */
 static uint8_t s_pascal_mode = 0;
 static uint8_t s_usb_connected = 0;
@@ -155,9 +216,10 @@ static void print_help(void)
         "  HELP\r\n"
         "  PING\r\n"
         "  MEM         (RAM total/free/minfree)\r\n"
-        "  PASCAL      (enter interpreter)\r\n"
-        "  FINDMIC     (find working mic SPI mode)\r\n"
-        "  MICDIAG     (mic SPI/DMA/pin diagnostics)\r\n"
+        "  PASCAL      (enter interpreter; QUIT to exit)\r\n"
+        "  MICDIAG     (mic SPI/DMA diagnostics)\r\n"
+        "  MICCAL()    (interactive: quiet->ENTER, buzzer->ENTER; auto SPL estimate; saves offset)\r\n"
+        "  MICCAL(x)   (interactive: quiet->ENTER, ext audio->ENTER; x=dB SPL @ mic; saves offset)\r\n"
         "  CHARGER     (battery %, state, VBAT)\r\n"
         "  CHGRST      (reset charger)\r\n"
         "  LOBATT_ENABLE (allow charging <1.7V once)\r\n"
@@ -176,7 +238,7 @@ static void print_help(void)
         "  PRESS()\r\n"
         "  MIC()\r\n"
         "  MICFFT()    (prints LF,MF,HF dBFS*100)\r\n"
-        "            bands: LF=100-400 MF=400-1600 HF=1600-4000 Hz\r\n"
+        "            bands: LF=100-400 MF=400-2000 HF=2000-8000 Hz\r\n"
         "  TIME()      (prints YY,MO,DD,HH,MM)\r\n"
         "  TIME(sel)   (return part: 0=YY 1=MO 2=DD 3=HH 4=MM 5=SS)\r\n"
         "  SETTIME(yy,mo,dd,hh,mm)   (set date+time, sec=0)\r\n"
@@ -234,15 +296,34 @@ static void handle_line(char *line)
         return;
     }
 
-    if (cli_stricmp(line, "findmic") == 0)
-    {
-        MIC_FindMic(cdc_write_str);
-        return;
-    }
-
     if (cli_stricmp(line, "micdiag") == 0)
     {
         MIC_WriteDiag(cdc_write_str);
+        return;
+    }
+
+    if (cli_stricmp(line, "miccal") == 0 || cli_is_call0(line, "miccal"))
+    {
+        mic_err_t st = MIC_CalibrateInteractiveAuto(cdc_write_str, cli_wait_enter, BEEP);
+        if (st != MIC_ERR_OK)
+        {
+            const char *msg = MIC_LastErrorMsg();
+            cdc_writef("ERR miccal %s(%ld) msg=%s\r\n",
+                       MIC_ErrName(st), (long)st, msg ? msg : "");
+        }
+        return;
+    }
+
+    float manual_spl_db = 0.0f;
+    if (cli_is_call1_float(line, "miccal", &manual_spl_db))
+    {
+        mic_err_t st = MIC_CalibrateInteractiveManualSpl(manual_spl_db, cdc_write_str, cli_wait_enter);
+        if (st != MIC_ERR_OK)
+        {
+            const char *msg = MIC_LastErrorMsg();
+            cdc_writef("ERR miccal %s(%ld) msg=%s\r\n",
+                       MIC_ErrName(st), (long)st, msg ? msg : "");
+        }
         return;
     }
 
@@ -339,12 +420,12 @@ void USB_CLI_Task(void)
     {
         mp_task();  /* Run VM time-slice + abort check */
         
-        /* Check if user typed EXIT or session ended */
+        /* Check if user typed QUIT/EXIT or session ended */
         if (mp_exit_pending() || !mp_is_active())
         {
             s_pascal_mode = 0;
             mp_stop_session();
-            cdc_write_str("\r\nPASCAL EXIT\r\n");
+            cdc_write_str("\r\nPASCAL QUIT\r\n");
             cdc_prompt();
             return;
         }

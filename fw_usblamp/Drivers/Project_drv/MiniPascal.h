@@ -60,7 +60,7 @@
 #endif
 
 #ifndef MP_FLASH_SLOT_COUNT
-#define MP_FLASH_SLOT_COUNT (3u)
+#define MP_FLASH_SLOT_COUNT (6u)
 #endif
 
 /* Abort button hold time (ms). Keep below reset-hold time if both use same pin. */

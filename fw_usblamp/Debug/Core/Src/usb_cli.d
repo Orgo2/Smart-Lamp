@@ -53,6 +53,7 @@ Core/Src/usb_cli.o: ../Core/Src/usb_cli.c ../Core/Inc/usb_cli.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/rtc.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h \
+ C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/alarm.h \
  C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h \
  ../Core/Inc/memmon.h
 ../Core/Inc/usb_cli.h:
@@ -112,5 +113,6 @@ Core/Src/usb_cli.o: ../Core/Src/usb_cli.c ../Core/Inc/usb_cli.h \
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/rtc.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/charger.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/mic.h:
+C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/alarm.h:
 C:/Users/orgo/Documents/Rado/lampa/Smart-Lamp/fw_usblamp/Drivers/Project_drv/MiniPascal.h:
 ../Core/Inc/memmon.h:

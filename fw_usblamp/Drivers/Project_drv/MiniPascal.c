@@ -34,7 +34,7 @@ static void mp_prompt(void);  /* forward declaration */
 static bool is_id0(char c);
 static bool is_idn(char c);
 static int builtin_id(const char *name);
-static void time_update_vars(int32_t *vars);
+static void time_update_sysvars(void);
 static void time_print_ymdhm(void);
 static bool is_time0_call(const char *line);
 static int time_sel_id(const char *name);
@@ -473,6 +473,8 @@ typedef struct {
   uint8_t bc[MP_BC_MAX];
   uint16_t len;
   symtab_t st;
+  int8_t sysvar_slot[SYSVAR_COUNT]; /* sysvar id -> slot index (or -1 if not used by program) */
+  uint8_t next_slot;                /* next free slot for new (sys/user) variable */
   uint16_t line_addr[MP_MAX_LINES];
   fixup_t fix[MP_MAX_FIXUPS];
   uint8_t fix_n;
@@ -511,21 +513,46 @@ static bool patch_u16(program_t *p, uint16_t at, uint16_t v){
   return true;
 }
 
-static int sym_find(const symtab_t *st, const char *name){
+static void program_vars_init(program_t *p)
+{
+  if (!p) return;
+  for (uint8_t i = 0; i < SYSVAR_COUNT; i++) p->sysvar_slot[i] = -1;
+  p->next_slot = 0;
+  p->st.count = 0;
+}
+
+static int sym_find(const program_t *p, const symtab_t *st, const char *name){
   int sv = sysvar_find(name);
-  if (sv >= 0) return sv;
+  if (sv >= 0)
+  {
+    if (!p) return -1;
+    int8_t idx = p->sysvar_slot[sv];
+    return (idx >= 0 && idx < MP_MAX_VARS) ? (int)idx : -1;
+  }
   for (uint8_t i=0;i<st->count;i++) if (!strncmp(st->syms[i].name, name, MP_NAME_LEN)) return st->syms[i].idx;
   return -1;
 }
-static int sym_get_or_add(symtab_t *st, const char *name){
+static int sym_get_or_add(program_t *p, symtab_t *st, const char *name){
   int sv = sysvar_find(name);
-  if (sv >= 0) return sv;
+  if (sv >= 0)
+  {
+    if (!p) return -1;
+    if (sv >= SYSVAR_COUNT) return -1;
+    int8_t existing = p->sysvar_slot[sv];
+    if (existing >= 0) return (int)existing;
+    if (p->next_slot >= MP_MAX_VARS) return -1;
+    uint8_t idx = p->next_slot++;
+    p->sysvar_slot[sv] = (int8_t)idx;
+    return (int)idx;
+  }
 
-  int f=sym_find(st,name);
+  int f=sym_find(p, st, name);
   if (f>=0) return f;
-  if ((uint16_t)SYSVAR_COUNT + st->count >= MP_MAX_VARS) return -1;
+  if (!p) return -1;
+  if (p->next_slot >= MP_MAX_VARS) return -1;
+  if (st->count >= MP_MAX_VARS) return -1;
 
-  uint8_t idx = (uint8_t)(SYSVAR_COUNT + st->count);
+  uint8_t idx = p->next_slot++;
   strncpy(st->syms[st->count].name, name, MP_NAME_LEN);
   st->syms[st->count].name[MP_NAME_LEN-1]=0;
   st->syms[st->count].idx=idx;
@@ -658,8 +685,8 @@ static bool primary(Ctx *c){
       return true;
     }
 
-    int idx=sym_get_or_add(&c->p->st, nm);
-    if (idx<0){ set_err("too many variables", c->line); return false; }
+    int idx=sym_get_or_add(c->p, &c->p->st, nm);
+    if (idx<0){ set_err("out of vars", c->line); return false; }
     if (!emit_u8(c->p, OP_LOAD) || !emit_u8(c->p, (uint8_t)idx)){ set_err("bytecode overflow", c->line); return false; }
     return true;
   }
@@ -845,8 +872,8 @@ static bool st_assign_or_call(Ctx *c){
 
   if (ac(c, T_ASSIGN)){
     if(!expr(c)) return false;
-    int idx = sym_get_or_add(&c->p->st, nm);
-    if (idx<0){ set_err("too many variables", c->line); return false; }
+    int idx = sym_get_or_add(c->p, &c->p->st, nm);
+    if (idx<0){ set_err("out of vars", c->line); return false; }
     if(!emit_u8(c->p, OP_STORE) || !emit_u8(c->p, (uint8_t)idx)){ set_err("bytecode overflow", c->line); return false; }
     return true;
   }
@@ -873,8 +900,8 @@ static bool st_assign_or_call(Ctx *c){
 
   if(!emit_u8(c->p, OP_CALL) || !emit_u8(c->p, (uint8_t)id) || !emit_u8(c->p, argc)){ set_err("bytecode overflow", c->line); return false; }
 
-  int dump = sym_get_or_add(&c->p->st, "__");
-  if (dump<0){ set_err("too many variables", c->line); return false; }
+  int dump = sym_get_or_add(c->p, &c->p->st, "__");
+  if (dump<0){ set_err("out of vars", c->line); return false; }
   if(!emit_u8(c->p, OP_STORE) || !emit_u8(c->p, (uint8_t)dump)){ set_err("bytecode overflow", c->line); return false; }
   return true;
 }
@@ -902,11 +929,12 @@ static int editor_index_by_line(const mp_editor_t *ed, uint16_t line_no);
 
 static bool compile_program(const mp_editor_t *ed, program_t *out){
   memset(out, 0, sizeof(*out));
+  program_vars_init(out);
   for (uint8_t i=0;i<MP_MAX_LINES;i++) out->line_addr[i]=0xFFFFu;
   g_err=0; g_err_line=-1;
 
-  if (MP_MAX_VARS < SYSVAR_COUNT + 8){
-    set_err("MP_MAX_VARS too small for system vars", -1);
+  if (MP_MAX_VARS < 8){
+    set_err("MP_MAX_VARS too small", -1);
     return false;
   }
 
@@ -1452,20 +1480,20 @@ static void help(void){
   mp_puts("\r\n");
   mp_puts("=== COMMANDS ===\r\n");
   mp_puts("  EDIT         edit current buffer\r\n");
-  mp_puts("  EDIT 1       edit program from slot 1 (1-3)\r\n");
+  mp_puts("  EDIT 1       edit program from slot 1 (1-6)\r\n");
   mp_puts("  NEW          clear program\r\n");
   mp_puts("  CLR          clear program (alias of NEW)\r\n");
   mp_puts("  LIST         show program\r\n");
   mp_puts("  RUN          compile and run\r\n");
   mp_puts("  STOP         stop running\r\n");
-  mp_puts("  EXIT         exit Pascal mode\r\n");
+  mp_puts("  QUIT         exit Pascal mode (alias: EXIT)\r\n");
   mp_puts("\r\n");
   mp_puts("=== EDIT MODE ===\r\n");
   mp_puts("  Arrow keys move, DEL/BKSP delete, ENTER splits line.\r\n");
   mp_puts("  Ctrl+Q exits edit mode (or type QUIT on its own line).\r\n");
   mp_puts("\r\n");
   mp_puts("=== FLASH STORAGE ===\r\n");
-  mp_puts("  SAVE 1       save to slot 1 (1-3)\r\n");
+  mp_puts("  SAVE 1       save to slot 1 (1-6)\r\n");
   mp_puts("  LOAD 1       load from slot\r\n");
   mp_puts("\r\n");
   mp_puts("=== PASCAL FUNCTIONS ===\r\n");
@@ -1524,6 +1552,7 @@ static void help(void){
   mp_puts("  x := 5       assign\r\n");
   mp_puts("  x := x + 1   expression\r\n");
   mp_puts("  IF x>5 THEN GOTO 100\r\n");
+  mp_puts("  IF x>5 THEN x:=1 ELSE x:=0\r\n");
   mp_puts("  TIME() then TIMEY/TIMEMO/TIMED/TIMEH/TIMEM\r\n");
   mp_puts("  x := time(MM)  minutes\r\n");
   mp_puts("  WRITELN('x=', x)\r\n");
@@ -1993,6 +2022,7 @@ static void edit_handle_escape(char c)
 static void compile_or_report(void){
   g_have_prog=false;
   memset(&g_prog,0,sizeof(g_prog));
+  program_vars_init(&g_prog);
   if (!compile_program(&g_ed, &g_prog)){
     mp_puts("Compile error");
     if (g_err_line>0){
@@ -2003,6 +2033,23 @@ static void compile_or_report(void){
     return;
   }
   g_have_prog=true;
+}
+
+static void print_compile_ok_stats(void)
+{
+  uint8_t used = g_prog.next_slot;
+  uint8_t free = (used <= MP_MAX_VARS) ? (uint8_t)(MP_MAX_VARS - used) : 0u;
+  uint8_t sys_used = 0u;
+  for (uint8_t i = 0; i < SYSVAR_COUNT; i++) if (g_prog.sysvar_slot[i] >= 0) sys_used++;
+
+  char b[16];
+  mp_puts("COMPILE OK: var_slots used=");
+  mp_itoa(used, b); mp_puts(b);
+  mp_puts("/"); mp_itoa(MP_MAX_VARS, b); mp_puts(b);
+  mp_puts(" free="); mp_itoa(free, b); mp_puts(b);
+  mp_puts(" (sys="); mp_itoa(sys_used, b); mp_puts(b);
+  mp_puts(" user="); mp_itoa(g_prog.st.count, b); mp_puts(b);
+  mp_puts(")\r\n");
 }
 
 static void cmd_run(void){
@@ -2061,7 +2108,7 @@ static void handle_line(char *line){
   if (!mp_stricmp(cmd,"DEL"))  { int ln=0; const char *p=args; if(parse_int(&p,&ln) && ed_delete(&g_ed,ln)) mp_puts("OK\r\n"); else mp_puts("Not found\r\n"); return; }
   if (!mp_stricmp(cmd,"RUN"))  { cmd_run(); return; }
   if (!mp_stricmp(cmd,"STOP")) { cmd_stop(); return; }
-  if (!mp_stricmp(cmd,"EXIT")) { g_exit_pending=true; return; }
+  if (!mp_stricmp(cmd,"QUIT") || !mp_stricmp(cmd,"EXIT")) { g_exit_pending=true; return; }
 
   if (!mp_stricmp(cmd,"SLOT")) {
     uint8_t s=g_slot;
@@ -2081,6 +2128,7 @@ static void handle_line(char *line){
     /* compile first; if compile fails, do not touch flash */
     compile_or_report();
     if (!g_have_prog) return;
+    print_compile_ok_stats();
 
     if (storage_save_slot(s, &g_ed, false)){
       g_slot = s;
@@ -2222,7 +2270,7 @@ void mp_start_session(void){
   g_edit = false;
   
   mp_putcrlf();
-  mp_puts("PASCAL READY (HELP for commands, EDIT to program, EXIT to quit)\r\n");
+  mp_puts("PASCAL READY (HELP for commands, EDIT to program, QUIT to quit)\r\n");
   mp_prompt();
 }
 
@@ -2421,7 +2469,7 @@ void mp_poll(void){
   static uint32_t last_time_ms = 0;
   if ((uint32_t)(now - last_time_ms) >= 1000u){
     last_time_ms = now;
-    time_update_vars(g_vm.vars);
+    if (g_have_prog) time_update_sysvars();
   }
 
   static uint32_t abort_start_ms = 0;
@@ -2513,25 +2561,46 @@ static bool time_read_ymdhms(int *yy, int *mo, int *dd, int *hh, int *mm, int *s
   return (RTC_GetYMDHMS(yy, mo, dd, hh, mm, ss) == HAL_OK);
 }
 
-static void time_update_vars(int32_t *vars){
-  if (!vars) return;
+static inline int sysvar_slot(uint8_t sysvar_id)
+{
+  if (!g_have_prog) return -1;
+  if (sysvar_id >= SYSVAR_COUNT) return -1;
+  int8_t idx = g_prog.sysvar_slot[sysvar_id];
+  if (idx < 0 || idx >= MP_MAX_VARS) return -1;
+  return (int)idx;
+}
+
+static inline void sysvar_set(uint8_t sysvar_id, int32_t v)
+{
+  int idx = sysvar_slot(sysvar_id);
+  if (idx >= 0) g_vm.vars[idx] = v;
+}
+
+static inline int32_t sysvar_get(uint8_t sysvar_id)
+{
+  int idx = sysvar_slot(sysvar_id);
+  return (idx >= 0) ? g_vm.vars[idx] : 0;
+}
+
+static void time_update_sysvars(void){
   int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
   if (!time_read_ymdhms(&yy,&mo,&dd,&hh,&mm,&ss)) return;
-  vars[SV_TIMEY] = yy;
-  vars[SV_TIMEMO] = mo;
-  vars[SV_TIMED] = dd;
-  vars[SV_TIMEH] = hh;
-  vars[SV_TIMEM] = mm;
-  vars[SV_TIMES] = ss;
+  sysvar_set(SV_TIMEY, yy);
+  sysvar_set(SV_TIMEMO, mo);
+  sysvar_set(SV_TIMED, dd);
+  sysvar_set(SV_TIMEH, hh);
+  sysvar_set(SV_TIMEM, mm);
+  sysvar_set(SV_TIMES, ss);
 }
 
 static void time_print_ymdhm(void){
-  time_update_vars(g_vm.vars);
-  mp_put2((uint8_t)g_vm.vars[SV_TIMEY]); mp_puts(",");
-  mp_put2((uint8_t)g_vm.vars[SV_TIMEMO]); mp_puts(",");
-  mp_put2((uint8_t)g_vm.vars[SV_TIMED]); mp_puts(",");
-  mp_put2((uint8_t)g_vm.vars[SV_TIMEH]); mp_puts(",");
-  mp_put2((uint8_t)g_vm.vars[SV_TIMEM]);
+  int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
+  if (!time_read_ymdhms(&yy,&mo,&dd,&hh,&mm,&ss)) return;
+  mp_put2((uint8_t)yy); mp_puts(",");
+  mp_put2((uint8_t)mo); mp_puts(",");
+  mp_put2((uint8_t)dd); mp_puts(",");
+  mp_put2((uint8_t)hh); mp_puts(",");
+  mp_put2((uint8_t)mm);
   mp_putcrlf();
 }
 
@@ -2645,7 +2714,7 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         const int32_t fault = -99900;
 
         int16_t dbfs_x100 = 0;
-        mic_err_t st = MIC_ReadDbfsX100_Blocking(250u, &dbfs_x100);
+        mic_err_t st = MIC_ReadDbfsX100_Blocking(1000u, &dbfs_x100);
         if (st != MIC_ERR_OK){
           if (mp_hal_usb_connected()){
             char b[160];
@@ -2672,15 +2741,15 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
                      MIC_ErrName(st), (long)st, msg ? msg : "");
             mp_puts(b);
           }
-          g_vm.vars[SV_MICLF] = 0;
-          g_vm.vars[SV_MICMF] = 0;
-          g_vm.vars[SV_MICHF] = 0;
+          sysvar_set(SV_MICLF, 0);
+          sysvar_set(SV_MICMF, 0);
+          sysvar_set(SV_MICHF, 0);
           return (int32_t)st;
         }
 
-        g_vm.vars[SV_MICLF] = (int32_t)lf;
-        g_vm.vars[SV_MICMF] = (int32_t)mf;
-        g_vm.vars[SV_MICHF] = (int32_t)hf;
+        sysvar_set(SV_MICLF, (int32_t)lf);
+        sysvar_set(SV_MICMF, (int32_t)mf);
+        sysvar_set(SV_MICHF, (int32_t)hf);
         return 0;
       }
       return -1;
@@ -2688,19 +2757,21 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
     /* ---------------- RTC clock + alarm ---------------- */
     case 10: /* time() or time(sel) */
       if (argc==0){
-        time_update_vars(g_vm.vars);
+        time_update_sysvars();
         return 0;
       }
       if (argc==1){
-        time_update_vars(g_vm.vars);
+        int yy=0,mo=0,dd=0,hh=0,mm=0,ss=0;
+        if (!time_read_ymdhms(&yy,&mo,&dd,&hh,&mm,&ss)) return -1;
+        time_update_sysvars();
         int sel = (int)argv[0];
         switch (sel){
-          case 0: return g_vm.vars[SV_TIMEY];
-          case 1: return g_vm.vars[SV_TIMEMO];
-          case 2: return g_vm.vars[SV_TIMED];
-          case 3: return g_vm.vars[SV_TIMEH];
-          case 4: return g_vm.vars[SV_TIMEM];
-          case 5: return g_vm.vars[SV_TIMES];
+          case 0: return yy;
+          case 1: return mo;
+          case 2: return dd;
+          case 3: return hh;
+          case 4: return mm;
+          case 5: return ss;
           default: return -1;
         }
       }
@@ -2715,7 +2786,7 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         char buf[RTC_DATETIME_STRING_SIZE];
         snprintf(buf,sizeof(buf), "%02u:%02u:%02u_%02u.%02u.%02u", hh, mm, 0u, yy, mo, dd);
         if (RTC_SetClock(buf)==HAL_OK){
-          time_update_vars(g_vm.vars);
+          time_update_sysvars();
           return 0;
         }
         return -1;
@@ -2727,7 +2798,7 @@ int32_t mp_user_builtin(uint8_t id, uint8_t argc, const int32_t *argv){
         snprintf(buf,sizeof(buf), "%02ld:%02ld:%02ld_%02d.%02d.%02d",
                  (long)argv[0], (long)argv[1], (long)argv[2], yy, mo, dd);
         if (RTC_SetClock(buf)==HAL_OK){
-          time_update_vars(g_vm.vars);
+          time_update_sysvars();
           return 0;
         }
         return -1;
